@@ -72,7 +72,7 @@ function fmtValue(v) {
  *   policy      —— service/policy.mjs 的 Policy 实例（缺省时跳过工具层策略，api 层仍可能拦）
  *   connections —— 取活连接的方式（ab_download_open 需要直连 connection.cmd）
  */
-export function buildMcpServer({ api, policy = null, connections = null } = {}) {
+export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null } = {}) {
   if (!api || typeof api.browsers?.getDefault !== 'function') {
     throw new TypeError('buildMcpServer requires { api } — createAgentApi() 的返回对象');
   }
@@ -110,11 +110,35 @@ export function buildMcpServer({ api, policy = null, connections = null } = {}) 
 
   /** 按可选 browserId 选浏览器：不给 = 默认（第一个连上的）。id 来自 ab_list_browsers。 */
   function pickBrowser(browserId) {
-    if (browserId === undefined || browserId === null || browserId === '') return api.browsers.getDefault();
+    if (browserId === undefined || browserId === null || browserId === '') {
+      const list = api.browsers.list();
+      if (!list.length) {
+        const e = new Error('no browser connected（服务活着，但没有浏览器扩展连上来）。排查：① 浏览器开着吗、扩展加载了吗（chrome://extensions 无红色报错）② 本机跑过 npm run setup 吗（没跑过就没有通信清单，扩展永远连不上）③ 端口对得上吗（npm run doctor 一条命令体检）');
+        e.code = -32000;
+        throw e;
+      }
+      return api.browsers.getDefault();
+    }
     const b = api.browsers.get(browserId);
     if (!b) { const e = new Error(`browser not found: ${browserId}（先跑 ab_list_browsers 看在线列表）`); e.code = -32002; throw e; }
     return b;
   }
+
+  // ---- 0. ab_status（区分"服务活着没浏览器" vs "更深的问题"；来自实战场教训）----
+  server.registerTool('ab_status', {
+    title: '服务体检',
+    description: '区分三种状态：服务正常且有浏览器在线 / 服务正常但没浏览器连入（浏览器侧断：查扩展加载与 npm run setup）/ 服务或前端模式异常。返回 {mode, port, uptimeSec, browsers, hint}。',
+    inputSchema: {},
+  }, guard(async () => {
+    const browsers = api.browsers.list();
+    const mode = serviceInfo?.mode ?? 'unknown';
+    const port = serviceInfo?.port ?? null;
+    const uptimeSec = serviceInfo?.startedAt ? Math.round((Date.now() - serviceInfo.startedAt) / 1000) : null;
+    const hint = browsers.length
+      ? `正常：${browsers.length} 台浏览器在线`
+      : '服务进程活着，但没有任何浏览器扩展连入 → 在目标浏览器确认扩展已从本机项目目录加载（chrome://extensions），并跑一次 npm run setup / npm run doctor';
+    return textResult({ mode, port, uptimeSec, browsers, hint });
+  }));
 
   // ---- 1. ab_list_browsers ----
   server.registerTool('ab_list_browsers', {

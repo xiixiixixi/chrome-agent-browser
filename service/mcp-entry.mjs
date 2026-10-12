@@ -80,7 +80,8 @@ export async function main(argv = process.argv.slice(2)) {
   // ---- 组装 api / MCP 面（两种模式共用；前端模式下 policy 在本进程本地生效） ----
   const getConnections = () => (manager ? manager.liveConnections() : remoteFrontend.liveConnections());
   const api = createAgentApi(getConnections, { policy });
-  const server = buildMcpServer({ api, policy, connections: getConnections });
+  const serviceInfo = { mode: manager ? 'service' : 'frontend', startedAt: Date.now(), port: args.port };
+  const server = buildMcpServer({ api, policy, connections: getConnections, serviceInfo });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

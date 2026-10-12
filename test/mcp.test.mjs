@@ -19,7 +19,7 @@ const REAL_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PzWvWQAAAABJRU5ErkJggg==';
 
 const ALL_TOOLS = [
-  'ab_list_browsers', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
+  'ab_list_browsers', 'ab_status', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
   'ab_screenshot', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open',
   'ab_confirm', 'browser_eval',
 ];
@@ -281,4 +281,31 @@ test('多浏览器：两台在线；browserId 指定 Arc 不串台；缺省走�
   } finally {
     await s.close();
   }
+});
+
+test('ab_status：有浏览器时返回在线列表与提示', async () => {
+  const s = await startMcpStack();
+  try {
+    const r = await s.callJson('ab_status', {});
+    assert.equal(r.mode, 'unknown'); // 测试直连 buildMcpServer 未传 serviceInfo
+    assert.ok(Array.isArray(r.browsers) && r.browsers.length === 1);
+    assert.ok(r.hint.includes('正常'));
+  } finally { await s.close(); }
+});
+
+test('无浏览器时 ab_new_tab 报带排查指引的错误', async () => {
+  const manager = new (await import('../service/connection.mjs')).ConnectionManager({ port: 0 });
+  await manager.start();
+  const policy = loadPolicy(null);
+  const api = createAgentApi(() => manager.liveConnections(), { policy });
+  const server = buildMcpServer({ api, policy, connections: () => manager.liveConnections() });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await server.connect(st);
+  const client = new Client({ name: 't', version: '0' });
+  await client.connect(ct);
+  const res = await client.callTool({ name: 'ab_new_tab', arguments: {} });
+  assert.ok(res.isError);
+  assert.ok(JSON.stringify(res).includes('no browser connected'));
+  assert.ok(JSON.stringify(res).includes('doctor'), '错误里应指向 doctor 排查');
+  await client.close(); await server.close(); await manager.stop();
 });

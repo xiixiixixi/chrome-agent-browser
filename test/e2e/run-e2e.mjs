@@ -51,14 +51,17 @@ const extId = (compute.stdout.match(/[a-p]{32}/) || [])[0];
 assert.ok(extId, '无法解析扩展 ID');
 console.log(`[e2e] 扩展 ID = ${extId}（来自路径哈希），服务端口 = ${port}`);
 
-const install = spawnSync('node', [join(ROOT, 'installer/install.mjs'), '--browser', 'chrome', '--extension-id', extId, '--port', String(port)], { encoding: 'utf8' });
-assert.equal(install.status, 0, `安装器失败: ${install.stderr}${install.stdout}`);
-const writtenManifests = (install.stdout.match(/^WRITE-MANIFEST .+$/gm) || []).map((l) => l.slice('WRITE-MANIFEST '.length).trim());
-console.log(`[e2e] 安装器写入 ${writtenManifests.length} 份清单`);
-
-// 保护用户真实配置：安装器会重写 host/host-config.json，测试结束需还原
+// 保护用户真实配置（顺序关键：必须在安装器跑之前读原值，安装器会重写它）
 const hostConfigPath = join(ROOT, 'host', 'host-config.json');
 const hostConfigBackup = existsSync(hostConfigPath) ? readFileSync(hostConfigPath, 'utf8') : null;
+
+// E2E 沙箱 HOME：清单全部写进沙箱（真实浏览器目录零接触）；Chrome 实际读的是
+// 下方 user-data-dir 里的那份副本（自定义 user-data-dir 时 Chromium 的查找位置）
+const SANDBOX_HOME = mkdtempSync(join(tmpdir(), 'ab-e2e-home-'));
+const install = spawnSync('node', [join(ROOT, 'installer/install.mjs'), '--browser', 'chrome', '--extension-id', extId, '--port', String(port), '--home', SANDBOX_HOME], { encoding: 'utf8' });
+assert.equal(install.status, 0, `安装器失败: ${install.stderr}${install.stdout}`);
+const writtenManifests = (install.stdout.match(/^WRITE-MANIFEST .+$/gm) || []).map((l) => l.slice('WRITE-MANIFEST '.length).trim());
+console.log(`[e2e] 安装器写入 ${writtenManifests.length} 份清单（沙箱 ${SANDBOX_HOME}）`);
 
 // ---- 2. 一次性浏览器环境 ----
 const udd = mkdtempSync(join(tmpdir(), 'ab-e2e-'));
@@ -174,6 +177,7 @@ try {
   await manager.stop().catch(() => {});
   httpServer.close();
   try { rmSync(udd, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* Chrome 仍占用则留给系统 */ }
+  try { rmSync(SANDBOX_HOME, { recursive: true, force: true }); } catch { /* noop */ }
   for (const p of writtenManifests) { try { rmSync(p, { force: true }); } catch { /* noop */ } }
   // 终扫：任何残留的 com.chromeagentbrowser.host 清单一律清掉（红线：真实浏览器目录不留痕）
   let leftover = 0;

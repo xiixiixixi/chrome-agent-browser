@@ -18,7 +18,9 @@
     "e2e": "node test/e2e/run-e2e.mjs",
     "selftest": "node service/service.mjs --selftest && node service/mcp-entry.mjs --help || true",
     "setup": "node setup.mjs",
-    "uninstall": "node uninstall.mjs"
+    "uninstall": "node uninstall.mjs",
+    "doctor": "node doctor.mjs",
+    "start": "node service/service.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0",

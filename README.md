@@ -53,6 +53,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 - **要开机自启吗？** 不用。`npm install` 只是放文件，不启动任何东西。
 - **服务什么时候启动？** MCP 客户端发起会话时按配置拉起 `mcp-entry.mjs` 子进程；客户端退出
   （stdin 关闭）或关掉会话，进程随之优雅退出。没有客户端连它，它就不存在。
+- **独立跑过服务又退出了，列表变空？** 服务是按需进程：`npm run doctor` 一条命令看断点；空列表≠报错，先 doctor。
 - **多个 MCP 客户端同时用？** 支持。第一个实例充当 service 并监听端口；后续实例探测到
   端口已占用后自动切换为「前端模式」连接既有服务，共享同一个浏览器连接；全部客户端退出后
   最后一个 service 进程退出，不留孤儿进程。
@@ -61,7 +62,8 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 
 | 工具 | 作用 |
 |---|---|
-| `ab_list_browsers` / `ab_open_tabs` | 列出受控浏览器 / 列出用户已开的标签页 |
+| `ab_status` / `ab_list_browsers` | **服务体检**（区分"没浏览器"vs"链路断"）/ 列出受控浏览器 |
+| `ab_open_tabs` | 列出用户已开的标签页（可选 `browserId` 指定目标，如 Arc） |
 | `ab_new_tab` / `ab_tab_info` / `ab_navigate` | 开标签页 / 读信息 / 导航（过策略门） |
 | `ab_screenshot` / `ab_ax_state` | 截图（PNG）/ 无障碍树文本 |
 | `ab_claim_tab` | 认领一个已开的用户标签页（标题/网址三重匹配，防认错） |
@@ -95,6 +97,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 ```bash
 npm test          # 37 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
+npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听，逐项给修复建议
 npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome）
 npm run check     # 全部语法检查
 ```
