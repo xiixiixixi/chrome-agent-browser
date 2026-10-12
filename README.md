@@ -8,7 +8,7 @@
 ┌─ 5 ─ MCP 客户端（任意支持 MCP 的 AI 工具）
 │        │ MCP over stdio（JSON-RPC 2.0）           ← service/mcp-entry.mjs（入口）
 │        ▼
-├─ 4 ─ MCP 工具面  service/mcp.mjs：13 个工具（ab_* 粗粒度 + browser_eval REPL）
+├─ 4 ─ MCP 工具面  service/mcp.mjs：15 个工具（ab_* 粗粒度 + browser_eval REPL）
 │        ▼
 ├─ 3 ─ service 命令层  service/api.mjs（Agent API）+ policy.mjs（策略门）
 │        + connection.mjs（WS 服务端 / 租约镜像 / 心跳）
