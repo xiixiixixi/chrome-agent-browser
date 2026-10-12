@@ -269,6 +269,46 @@ test('webmcp：不支持的浏览器（-32011）错误码透传到 api 层', asy
   } finally { mock.close(); await manager.stop(); }
 });
 
+test('onWebmcpTools 推送：收件箱快照 → getTabContext 附 webmcpHint；清单清空后 hint 消失', async () => {
+  const { manager, api } = await startStack();
+  const mock = await connectMock(manager);
+  try {
+    const b = api.browsers.getDefault();
+    const tab = await b.tabs.new({});
+    // 无通知时：不附 hint（不能凭空提示）
+    let ctx = await b.user.getTabContext({ tabId: tab.id });
+    assert.equal(ctx.webmcpHint, undefined);
+
+    // tab 创建后伪扩展上报一条工具变化通知（完整清单快照）
+    mock.emitEvent(EV.WEBMCP_TOOLS, { tabId: tab.id, kind: 'added', toolNames: ['ab_echo', 'get_time'] });
+    await sleep(80); // WS 通知异步落地
+    ctx = await b.user.getTabContext({ tabId: tab.id });
+    assert.deepEqual(ctx.webmcpHint, { toolNames: ['ab_echo', 'get_time'], count: 2 });
+
+    // api.webmcpHint 同源可查；未知 tab 返回 null
+    assert.deepEqual(api.webmcpHint(b.browserId, tab.id), { toolNames: ['ab_echo', 'get_time'], count: 2 });
+    assert.equal(api.webmcpHint(b.browserId, 999999), null);
+
+    // 清单清空（换页）→ hint 不再附带
+    mock.emitEvent(EV.WEBMCP_TOOLS, { tabId: tab.id, kind: 'changed', toolNames: [] });
+    await sleep(80);
+    ctx = await b.user.getTabContext({ tabId: tab.id });
+    assert.equal(ctx.webmcpHint, undefined);
+  } finally { mock.close(); await manager.stop(); }
+});
+
+test('webmcp.list() 成功后回填收件箱（通知丢失也能出 hint）', async () => {
+  const { manager, api } = await startStack();
+  const mock = await connectMock(manager);
+  try {
+    const b = api.browsers.getDefault();
+    const tab = await b.tabs.new({});
+    await tab.capabilities.get('webmcp').list(); // mock 默认两个工具
+    const ctx = await b.user.getTabContext({ tabId: tab.id });
+    assert.deepEqual(ctx.webmcpHint, { toolNames: ['get_time', 'set_note'], count: 2 });
+  } finally { mock.close(); await manager.stop(); }
+});
+
 test('断连保留镜像租约，同 instanceId 重连恢复', async () => {
   const { manager, api } = await startStack();
   const mock = await connectMock(manager);

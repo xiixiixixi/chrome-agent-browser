@@ -95,7 +95,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | `ab_claim_tab` | 认领一个已开的用户标签页（标题/网址三重匹配，防认错） |
 | `ab_cdp` / `ab_download_open` | 原样 CDP（白名单+确认门）/ 打开下载文件（确认门） |
 | `ab_confirm` | 批准一次待确认动作（5 分钟一次性令牌） |
-| `ab_webmcp` | **WebMCP**：发现/调用网页自己申报的结构化工具（`action:list\|invoke`；非只读工具过确认门） |
+| `ab_webmcp` | **WebMCP**：发现/调用网页自己申报的结构化工具（`action:list\|invoke`；非只读工具过确认门）。页面申报的工具会**自动提示**：`ab_tab_info`/导航返回的 `webmcpHint` 与运行中的日志推送，无提示再手动 list |
 | `browser_eval` | **核心特色**：给 agent 一段代码，内含完整 API 对象 `agent`，一次完成「看页面→操作→验证」循环 |
 
 ## 安全模型

@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { ConnectionManager } from '../service/connection.mjs';
 import { createAgentApi } from '../service/api.mjs';
 import { loadPolicy } from '../service/policy.mjs';
@@ -124,6 +125,46 @@ test('ab_webmcp：不支持 WebMCP 的浏览器返回 -32011 结构化错误', a
     const parsed = JSON.parse(res.content.find((c) => c.type === 'text').text);
     assert.equal(parsed.code, -32011);
     assert.match(parsed.error, /WebMCP/);
+  } finally { await s.close(); }
+});
+
+test('onWebmcpTools 推送式发现：ab_tab_info 附 webmcpHint + notifications/message 即时推送 + 去重 + ab_webmcp list 不受影响', async () => {
+  const s = await startMcpStack();
+  try {
+    // 客户端订阅 notifications/message（SDK 客户端默认不特殊处理，手动挂监听）
+    const logs = [];
+    s.client.setNotificationHandler(LoggingMessageNotificationSchema, (n) => { logs.push(n.params); });
+
+    const { tabId } = await s.callJson('ab_new_tab', {});
+    const info0 = await s.callJson('ab_tab_info', { tabId });
+    assert.equal(info0.webmcpHint, undefined, '无通知时不应凭空出现 hint');
+
+    // 伪扩展上报工具新增（完整清单快照）→ 收件箱 + 日志推送
+    s.mock.emitEvent('onWebmcpTools', { tabId, kind: 'added', toolNames: ['ab_echo', 'get_time'] });
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error('2s 内未收到 notifications/message')), 2000);
+      const poll = () => { if (logs.length) { clearTimeout(t); res(); } else setTimeout(poll, 20); };
+      poll();
+    });
+    assert.equal(logs[0].level, 'info');
+    assert.equal(logs[0].logger, 'webmcp');
+    assert.match(logs[0].data, new RegExp(`tab ${tabId} 新增 WebMCP 工具: ab_echo,get_time`));
+
+    const info = await s.callJson('ab_tab_info', { tabId });
+    assert.deepEqual(info.webmcpHint, { toolNames: ['ab_echo', 'get_time'], count: 2 });
+
+    // 相同清单再推一条 → 去重（不重复打扰）
+    s.mock.emitEvent('onWebmcpTools', { tabId, kind: 'added', toolNames: ['ab_echo', 'get_time'] });
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(logs.length, 1, '同清单应去重，不重复推送');
+
+    // ab_webmcp list 仍是权威路径，不受推送影响（mock 默认两个工具）
+    const list = await s.callJson('ab_webmcp', { action: 'list', tabId });
+    assert.equal(list.tools.length, 2);
+    assert.deepEqual(list.tools.map((t) => t.name), ['get_time', 'set_note']);
+    // list 成功回填收件箱 → hint 刷新为 list 结果
+    const info2 = await s.callJson('ab_tab_info', { tabId });
+    assert.deepEqual(info2.webmcpHint, { toolNames: ['get_time', 'set_note'], count: 2 });
   } finally { await s.close(); }
 });
 

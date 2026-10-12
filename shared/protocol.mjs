@@ -25,6 +25,9 @@ export const EV = {
   DOWNLOAD_CHANGE: 'onDownloadChange', // {downloadId, state, filename?}
   DIALOG: 'onJsDialog', // {tabId, dialog}
   BADGES: 'onBadgeChange', // {tabId, badge}
+  // 页面申报的 WebMCP 工具发生变化（扩展在 WebMCP.enable 后收到 toolsAdded/toolsRemoved
+  // 或主文档换页时上报）。toolNames 是该 tab 当前的完整工具名清单快照（非增量）。
+  WEBMCP_TOOLS: 'onWebmcpTools', // {tabId, kind:'added'|'removed'|'changed', toolNames:[string]}
 };
 
 // Service -> extension commands. Method name === command type (flat).

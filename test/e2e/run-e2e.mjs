@@ -166,6 +166,7 @@ try {
       assert.ok(tabs.some((t) => (t.url || '').startsWith(pageUrl)), JSON.stringify(tabs.map((t) => t.url)));
     });
     // 条件用例：WebMCP 依赖浏览器的实验 CDP 域与页面 JS API——任一缺失时打印 SKIP 原因并算通过
+    let webmcpSkip = null; // 供后续推送式发现用例复用同一 SKIP 条件
     await step('WebMCP：页面工具发现与调用（不支持则 SKIP）', async () => {
       const webmcp = tab.capabilities.get('webmcp');
       let tools;
@@ -173,13 +174,15 @@ try {
         tools = await webmcp.list();
       } catch (err) {
         if (err && err.code === ERR.WEBMCP_UNSUPPORTED) {
-          console.log(`        SKIP：此 Chromium 无 WebMCP CDP 域（${err.message}；需更新版 Chrome / 实验开关）`);
+          webmcpSkip = `此 Chromium 无 WebMCP CDP 域（${err.message}；需更新版 Chrome / 实验开关）`;
+          console.log(`        SKIP：${webmcpSkip}`);
           return;
         }
         throw err;
       }
       if (!Array.isArray(tools) || tools.length === 0) {
-        console.log('        SKIP：WebMCP 域可用但页面未申报工具（页面 JS API 需 --enable-experimental-web-platform-features）');
+        webmcpSkip = 'WebMCP 域可用但页面未申报工具（页面 JS API 需 --enable-experimental-web-platform-features）';
+        console.log(`        SKIP：${webmcpSkip}`);
         return;
       }
       const names = tools.map((t) => t.name);
@@ -198,6 +201,20 @@ try {
         out = await webmcp.invoke('ab_echo', { msg: 'hi' }, { confirmationToken: err.token });
       }
       assert.deepEqual(out, { content: [{ type: 'text', text: 'echo:hi' }] });
+    });
+    // 推送式发现（v0.2.1）：上面的 list 使扩展 WebMCP.enable → toolsAdded，扩展随即把
+    // 完整工具名快照经 onWebmcpTools 上报 → 服务收件箱 → tab_info 附带 webmcpHint。
+    await step('WebMCP 推送式发现：tab_info 出现 webmcpHint 且含 ab_echo（不支持则 SKIP）', async () => {
+      if (webmcpSkip) { console.log(`        SKIP：${webmcpSkip}`); return; }
+      let ctx = null;
+      for (let i = 0; i < 10 && !(ctx && ctx.webmcpHint); i++) {
+        ctx = await browser.user.getTabContext({ tabId: tab.id }); // 通知经 host 中继异步落地，短轮询
+        if (!ctx.webmcpHint) await new Promise((r) => setTimeout(r, 200));
+      }
+      assert.ok(ctx && ctx.webmcpHint, `tab_info 应附带 webmcpHint: ${JSON.stringify(ctx)}`);
+      assert.ok(ctx.webmcpHint.toolNames.includes('ab_echo'),
+        `webmcpHint.toolNames 应含 ab_echo: ${JSON.stringify(ctx.webmcpHint)}`);
+      assert.equal(ctx.webmcpHint.count, ctx.webmcpHint.toolNames.length);
     });
     await step('tab.close() 后标签页消失', async () => {
       await tab.close();

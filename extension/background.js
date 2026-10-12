@@ -1111,6 +1111,13 @@ function webmcpRemoveTools(tabId, params) {
   }
 }
 
+// 工具清单变化上报：把该 tab 的完整工具名快照推给 service（尽力而为，不等待）。
+// service 侧用它维护轻量收件箱，让 tab_info / 导航返回能附带 webmcpHint（推送式发现）。
+function webmcpNotifyTools(tabId, kind) {
+  const m = st.webmcpTools.get(tabId);
+  sendNotification(EV.WEBMCP_TOOLS, { tabId, kind, toolNames: m ? [...m.keys()] : [] });
+}
+
 // 确保 WebMCP 域已启用且缓存就绪：enable → 等 toolsAdded（至多 WEBMCP_LIST_WAIT_MS）。
 // 返回该 tab 的工具 Map（无事件 = 页面没申报工具，或页面 JS API 未启用）。
 async function webmcpRefresh(tabId) {
@@ -1339,10 +1346,13 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     pushDevLog(tabId, 'error', exceptionToText(params && params.exceptionDetails));
   }
   // WebMCP：工具增删缓存 + 命令等待器唤醒（toolsAdded/toolsRemoved/toolResponded）
+  //   缓存变化后顺手上报 onWebmcpTools（完整工具名快照），service 侧做推送式发现提示。
   if (method === 'WebMCP.toolsAdded') {
     webmcpMergeTools(tabId, params);
+    webmcpNotifyTools(tabId, 'added');
   } else if (method === 'WebMCP.toolsRemoved') {
     webmcpRemoveTools(tabId, params);
+    webmcpNotifyTools(tabId, 'removed');
   } else if (method === 'WebMCP.toolResponded') {
     const key = String((params && params.invocationId) || '');
     const w = st.webmcpInvokeWaiters.get(key);
@@ -1352,6 +1362,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     }
   } else if (method === 'Page.frameNavigated' && params && params.frame && !params.frame.parentId) {
     st.webmcpTools.delete(tabId); // 主文档换页：旧文档申报的工具全部失效
+    webmcpNotifyTools(tabId, 'changed'); // 旧工具清单已清空（快照=[]）
   }
   pushCdpEvent(tabId, method, params);
   sendNotification(EV.CDP, { tabId, method, params: params || {} });

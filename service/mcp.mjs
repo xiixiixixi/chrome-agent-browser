@@ -76,10 +76,42 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   if (!api || typeof api.browsers?.getDefault !== 'function') {
     throw new TypeError('buildMcpServer requires { api } — createAgentApi() 的返回对象');
   }
-  const server = new McpServer({ name: 'chrome-agent-browser', version: '0.2.0' });
+  // capabilities.logging：声明后 sendLoggingMessage 才会真的发 notifications/message
+  //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
+  //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
+  const server = new McpServer(
+    { name: 'chrome-agent-browser', version: '0.2.1' },
+    { capabilities: { logging: {} } },
+  );
 
   // tabId → { browser, tab }：new/claim 时登记；未知 tabId 跨浏览器探测后缓存
   const tabRegistry = new Map();
+
+  // ---- WebMCP 推送：onWebmcpTools 通知 → notifications/message（info 级一行） ----
+  // 触达式订阅（连接可能在 server 构建后才连入）；同清单只推一次（按 tab 去重）。
+  const webmcpWatched = new WeakSet();
+  const webmcpLastSent = new Map(); // `${instanceId}:${tabId}` -> 清单拼接串（去重基线）
+  const KIND_LABEL = { added: '新增', removed: '移除', changed: '变更' };
+  function ensureWebmcpPush() {
+    for (const conn of liveConns(connections)) {
+      if (webmcpWatched.has(conn)) continue;
+      webmcpWatched.add(conn);
+      conn.on('webmcp', (p) => {
+        if (!p || !Number.isInteger(p.tabId)) return;
+        const names = Array.isArray(p.toolNames) ? p.toolNames.filter((n) => typeof n === 'string') : [];
+        const key = `${conn.instanceId}:${p.tabId}`;
+        const joined = names.join(',');
+        if (webmcpLastSent.get(key) === joined) return; // 清单没变不重复打扰
+        webmcpLastSent.set(key, joined);
+        const kind = KIND_LABEL[p.kind] || '变更';
+        const data = names.length
+          ? `tab ${p.tabId} ${kind} WebMCP 工具: ${joined}`
+          : `tab ${p.tabId} WebMCP 工具清单已清空`;
+        server.sendLoggingMessage({ level: 'info', logger: 'webmcp', data })
+          .catch(() => { /* 未连接/客户端不支持：收件箱 hint 仍在 */ });
+      });
+    }
+  }
 
   const policyCheck = (input, opts) => (policy ? policy.check(input, opts) : { allowed: true });
 
@@ -183,6 +215,7 @@ export function buildMcpServer({ api, policy = null, connections = null, service
       browserId: z.string().optional().describe('目标浏览器 id（ab_list_browsers 的 id，如 Arc；缺省=默认浏览器）'),
     },
   }, guard(async ({ url, browserId }) => {
+    ensureWebmcpPush();
     if (url !== undefined) {
       const v = policyCheck({ kind: 'navigate', url });
       if (!v.allowed) return textResult({ blocked: true, reason: v.reason, code: v.code ?? 'POLICY_BLOCKED' });
@@ -190,7 +223,8 @@ export function buildMcpServer({ api, policy = null, connections = null, service
     const browser = pickBrowser(browserId);
     const tab = await browser.tabs.new(url !== undefined ? { url } : {});
     tabRegistry.set(tab.id, { browser, tab });
-    return textResult({ tabId: tab.id });
+    const hint = api.webmcpHint(browser.browserId, tab.id);
+    return textResult({ tabId: tab.id, ...(hint ? { webmcpHint: hint } : {}) });
   }));
 
   // ---- 4. ab_tab_info ----
@@ -199,9 +233,13 @@ export function buildMcpServer({ api, policy = null, connections = null, service
     description: '读取标签页当前 url/title。返回 {tabId,url,title}。',
     inputSchema: { tabId: z.number().int().describe('标签页 id（ab_new_tab/ab_claim_tab 返回）') },
   }, guard(async ({ tabId }) => {
+    ensureWebmcpPush();
     const { browser } = await resolveTab(tabId);
-    const ctx = await browser.user.getTabContext({ tabId }); // 只读 tab_info，绕过句柄缓存取最新
-    return textResult({ tabId, url: ctx.url, title: ctx.title });
+    const ctx = await browser.user.getTabContext({ tabId }); // 只读 tab_info，绕过句柄缓存取最新（有申报工具时附 webmcpHint）
+    return textResult({
+      tabId, url: ctx.url, title: ctx.title,
+      ...(ctx.webmcpHint ? { webmcpHint: ctx.webmcpHint } : {}),
+    });
   }));
 
   // ---- 5. ab_navigate ----
@@ -213,11 +251,15 @@ export function buildMcpServer({ api, policy = null, connections = null, service
       url: z.string().min(1),
     },
   }, guard(async ({ tabId, url }) => {
+    ensureWebmcpPush();
     const v = policyCheck({ kind: 'navigate', url });
     if (!v.allowed) return textResult({ blocked: true, reason: v.reason, code: v.code ?? 'POLICY_BLOCKED' });
-    const { tab } = await resolveTab(tabId);
+    const { browser, tab } = await resolveTab(tabId);
     await tab.goto(url); // api 层会再过一次同规则策略（幂等，无害）
-    return textResult({ ok: true, tabId, url });
+    // 稍候一拍让换页的 onWebmcpTools 通知（旧清单清空/新页面申报）落进收件箱再读 hint
+    await new Promise((r) => setTimeout(r, 25));
+    const hint = api.webmcpHint(browser.browserId, tabId);
+    return textResult({ ok: true, tabId, url, ...(hint ? { webmcpHint: hint } : {}) });
   }));
 
   // ---- 6. ab_screenshot ----
@@ -339,15 +381,16 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   // ---- 11b. ab_webmcp（页面自声明 WebMCP 工具） ----
   server.registerTool('ab_webmcp', {
     title: 'WebMCP：发现/调用页面申报的工具',
-    description: '调用网页按 WebMCP 标准自己申报的结构化工具（页面 JS API document.modelContext.registerTool）。用法：先 action=list 看页面申报了什么工具（返回 name/description/inputSchema/readOnly）；再 action=invoke 调用。readOnly=true 的工具直接调用；readOnly=false（页面未标注的也算 false）首次会返回 {needConfirmation,description,token}——经 ab_confirm 批准后带 confirmationToken 重试同一调用即放行（页面声明的工具可能改站点状态，故非只读需确认）。旧版 Chrome 无 WebMCP 域时返回 code=-32011 的错误。',
+    description: '调用网页按 WebMCP 标准自己申报的结构化工具（页面 JS API document.modelContext.registerTool）。页面申报的工具通常会通过提示自动出现（tab_info / ab_new_tab / ab_navigate 返回的 webmcpHint，以及运行中推送的 notifications/message 日志）；无提示再手动 action=list（返回 name/description/inputSchema/readOnly），action=invoke 调用。readOnly=true 的工具直接调用；readOnly=false（页面未标注的也算 false）首次会返回 {needConfirmation,description,token}——经 ab_confirm 批准后带 confirmationToken 重试同一调用即放行（页面声明的工具可能改站点状态，故非只读需确认）。旧版 Chrome 无 WebMCP 域时返回 code=-32011 的错误。',
     inputSchema: {
       action: z.enum(['list', 'invoke']).describe('list=列出页面申报的工具；invoke=调用一个工具'),
       tabId: z.number().int().describe('标签页 id（ab_new_tab/ab_claim_tab 返回）'),
-      name: z.string().min(1).optional().describe('action=invoke 时必填：工具名（来自 list 结果）'),
+      name: z.string().min(1).optional().describe('action=invoke 时必填：工具名（来自 webmcpHint 或 list 结果）'),
       args: z.record(z.any()).optional().describe('action=invoke 时的工具入参（按 inputSchema 构造）'),
       confirmationToken: z.string().optional().describe('ab_confirm 批准后的一次性令牌（非只读工具第二次调用时带）'),
     },
   }, guard(async ({ action, tabId, name, args, confirmationToken }) => {
+    ensureWebmcpPush();
     const { tab } = await resolveTab(tabId);
     const webmcp = tab.capabilities.get('webmcp');
     if (!webmcp) return textResult({ blocked: true, reason: 'browser has no webmcp capability' });

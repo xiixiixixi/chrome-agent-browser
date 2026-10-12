@@ -56,6 +56,12 @@ service (service/service.mjs) ——命令层 + 租约镜像 + MCP 服务器
   扩展侧发 `WebMCP.invokeTool`（frameId 取工具申报 frame），经 `toolResponded` 事件收结果（等待上限 12s，须低于命令超时 15s；超时发 `WebMCP.cancelInvocation`）。
 - 浏览器无 WebMCP 域（旧版 Chrome）→ 错误码 `-32011 WEBMCP_UNSUPPORTED`。
 - 策略门（service 层）：`webmcp_invoke` 的 readOnly 工具放行；非 readOnly 首次返回待确认（`POLICY_BLOCKED` + 一次性 token），批准后带 `confirmationToken` 重试放行。
+- **推送式发现通知（v0.2.1）**：扩展在 WebMCP 域已启用（首次 `webmcp_list_tools` 后）收到 `toolsAdded`/`toolsRemoved`，或主文档换页清缓存时，上报
+  `onWebmcpTools {tabId, kind:'added'|'removed'|'changed', toolNames:[string]}`（`toolNames` 为该 tab **完整工具名快照**，非增量）。
+  service 侧：
+  - `connection` 把它分发为 `webmcp` 事件；`api` 层全局收件箱按 `instanceId:tabId` 保留最近一次快照 + 时间戳（`webmcp_list_tools` 成功也回填）；
+  - `tab_info`（含 `user.getTabContext`）、`ab_new_tab`、`ab_navigate` 的返回在该 tab 有已申报工具时附 `webmcpHint:{toolNames, count}`；
+  - MCP 面（若客户端支持日志通知）在收到清单变化时即时推送一行 `notifications/message`（info 级，logger=`webmcp`；同清单去重只推一次）。
 
 ## 6. 安全门（service 层强制）
 

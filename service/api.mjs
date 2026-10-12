@@ -9,6 +9,8 @@
 // 约定：
 //   - 命令走 connection.cmd（命令目录见 shared/protocol.mjs COMMANDS）。
 //   - page 事件（onPageEvent）更新 tab 缓存 url/title；event==='removed' 判 tab 失效。
+//   - onWebmcpTools 通知进全局收件箱；user.getTabContext 有申报工具时附 webmcpHint，
+//     并导出 api.webmcpHint(browserId, tabId) 供 MCP 面（ab_new_tab/ab_navigate）引用。
 //   - tab 关闭（本地 close 或 removed 事件）后所有方法抛错（code=ERR.TAB_NOT_FOUND）。
 //   - ERR.LEASE_CONFLICT 转成清晰 Error，.code 保留。
 //   - CDP：服务端持 CDP_ALLOWLIST 副本先拒（默认拒绝），再过 policy.confirmCdp 确认门。
@@ -68,8 +70,57 @@ function mapRpcError(err, prefix = '') {
 export function createAgentApi(getConnections, { policy = null } = {}) {
   const wrapped = new Map(); // conn -> browser 包装（避免重复订阅 page 事件）
 
+  // ---- WebMCP 推送收件箱（v0.2.1：推送式发现）----
+  // 扩展在页面申报的工具增删/换页时上报 onWebmcpTools {tabId, kind, toolNames}（完整快照）。
+  // 这里按 `${instanceId}:${tabId}` 保留最近一次清单 + 时间戳；tab_info / 导航 / 开标签
+  // 的返回在有条目时附带 `webmcpHint:{toolNames,count}`，模型因此无需先手动 list 就能
+  // 看到页面有哪些工具（手动 list 仍是权威路径，见 mcp 面 ab_webmcp）。
+  const webmcpInbox = new Map(); // key -> {toolNames:[string], kind, updatedAt}
+  const webmcpWatched = new WeakSet(); // 已订阅 onWebmcpTools 的连接
+
+  function webmcpInboxKey(instanceId, tabId) { return `${instanceId}:${tabId}`; }
+
+  /** 连接的 onWebmcpTools 通知 → 收件箱快照更新（幂等，重复订阅由 WeakSet 挡）。 */
+  function watchWebmcp(conn) {
+    if (!conn || webmcpWatched.has(conn)) return;
+    webmcpWatched.add(conn);
+    conn.on('webmcp', (p) => {
+      if (!p || !Number.isInteger(p.tabId)) return;
+      const names = Array.isArray(p.toolNames) ? p.toolNames.filter((n) => typeof n === 'string') : [];
+      webmcpInbox.set(webmcpInboxKey(conn.instanceId, p.tabId), {
+        toolNames: names, kind: String(p.kind || 'changed'), updatedAt: Date.now(),
+      });
+    });
+  }
+
   function liveConns() {
     return getConnections().filter((c) => c.instanceId && !c.isClosed);
+  }
+
+  /** 触达式订阅：每次读 hint 前把当前活跃连接都挂上监听（连接晚于首次读取时补挂）。 */
+  function watchAllWebmcp() {
+    for (const c of liveConns()) watchWebmcp(c);
+  }
+
+  /**
+   * 读取某 tab 的推送式发现提示。
+   * @returns {{toolNames:string[], count:number}|null} 无申报（或从未收到通知）时 null。
+   */
+  function webmcpHint(browserId, tabId) {
+    watchAllWebmcp();
+    if (!Number.isInteger(tabId)) return null;
+    const snap = webmcpInbox.get(webmcpInboxKey(browserId, tabId));
+    if (!snap || snap.toolNames.length === 0) return null;
+    return { toolNames: [...snap.toolNames], count: snap.toolNames.length };
+  }
+
+  /** 写入快照（webmcp.list() 成功后回填，防通知丢失时收件箱仍可感知）。 */
+  function recordWebmcpTools(instanceId, tabId, tools) {
+    const names = (Array.isArray(tools) ? tools : [])
+      .filter((t) => t && typeof t.name === 'string').map((t) => t.name);
+    webmcpInbox.set(webmcpInboxKey(instanceId, tabId), {
+      toolNames: names, kind: 'changed', updatedAt: Date.now(),
+    });
   }
 
   const browsers = {
@@ -97,6 +148,7 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
   function wrapBrowser(conn) {
     if (wrapped.has(conn)) return wrapped.get(conn);
     const state = { sessionId: null, turnId: null, tabCount: 0, pageCache: new Map(), tabs: new Map(), webmcpCache: new Map() };
+    watchWebmcp(conn); // 工具变化通知进收件箱（webmcpHint 的数据源）
 
     // page 事件 → tab 缓存 {url,title,removed}
     conn.on('page', (p) => {
@@ -221,6 +273,7 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
               async list() {
                 const r = await call('webmcp_list_tools', { tabId });
                 state.webmcpCache.set(tabId, new Map((r.tools ?? []).filter((t) => t && typeof t.name === 'string').map((t) => [t.name, t])));
+                recordWebmcpTools(conn.instanceId, tabId, r.tools); // 收件箱回填（防通知丢失）
                 return r.tools ?? [];
               },
               /**
@@ -325,13 +378,17 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
           state.tabCount += 1;
           return makeTab(r.tabId, { url: p.url, title: p.title });
         },
-        /** 读上下文不认领（tab_info 只读）。 */
+        /** 读上下文不认领（tab_info 只读）；有已申报 WebMCP 工具时附 webmcpHint。 */
         async getTabContext(tabInfo = {}) {
           const p = zClaim.parse(tabInfo);
           const tabId = p.tabId ?? p.providerTabId;
           if (!Number.isInteger(tabId)) throw new TypeError('getTabContext requires tabId number');
-          try { return await conn.cmd('tab_info', { tabId }); }
+          watchWebmcp(conn);
+          let r;
+          try { r = await conn.cmd('tab_info', { tabId }); }
           catch (err) { throw mapRpcError(err, 'getTabContext: '); }
+          const hint = webmcpHint(conn.instanceId, tabId);
+          return hint ? { ...r, webmcpHint: hint } : r;
         },
       },
       async history({ limit } = {}) {
@@ -355,5 +412,5 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
     return browser;
   }
 
-  return { browsers };
+  return { browsers, webmcpHint };
 }
