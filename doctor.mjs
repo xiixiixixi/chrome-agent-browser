@@ -36,7 +36,7 @@ check('项目扩展目录 extension/ 存在', () => existsSync(path.join(ROOT, '
 let port = null;
 check('host/host-config.json 存在', () => {
   const p = path.join(ROOT, 'host', 'host-config.json');
-  if (!existsSync(p)) return { ok: false, detail: '没有这份配置说明本机没跑过 npm run setup（扩展的宿主进程不知道往哪拨号）→ 跑 npm run setup' };
+  if (!existsSync(p)) return { ok: false, detail: '没有这份配置说明本机没跑过 npm run setup（扩展的宿主进程不知道往哪拨号）→ 跑 chrome-agent-browser（npm 安装）或 npm run setup（源码）' };
   const cfg = JSON.parse(readFileSync(p, 'utf8'));
   port = cfg.servicePort;
   return { ok: true, detail: `端口 ${cfg.servicePort}` };
@@ -54,7 +54,7 @@ for (const f of families) {
   check(`浏览器 ${f} 的通信清单`, () => {
     const r = checkNativeHostManifest(f);
     if (r.ok) return { ok: true, detail: '已安装且指向本项目的宿主' };
-    return { ok: false, detail: `${r.problems.join('; ')} → npm run setup（或 --browser ${f} 单独装）` };
+    return { ok: false, detail: `${r.problems.join('; ')} → chrome-agent-browser -- --browser ${f}（源码：npm run setup -- --browser ${f}）` };
   });
 }
 
@@ -62,7 +62,7 @@ const listening = port ? await portListening('127.0.0.1', port) : false;
 if (port) {
   check(`端口 ${port} 有服务在听`, () => listening
     ? { ok: true, detail: '服务在线（MCP 客户端会话或独立服务进程）' }
-    : { ok: false, detail: '当前没有服务进程。判断：你的 AI 客户端 MCP 会话正开着 → 这就是"空列表"的根因，重启会话或 npm run start；没开会话 → 此项正常（服务按需启动，无需常驻）' });
+    : { ok: false, detail: '当前没有服务进程。判断：你的 AI 客户端 MCP 会话正开着 → 这就是"空列表"的根因，重启会话（或 chrome-agent-browser-mcp / npm run start 手动起服务）；没开会话 → 此项正常（服务按需启动，无需常驻）' });
 }
 
 console.log('chrome-agent-browser 体检报告');

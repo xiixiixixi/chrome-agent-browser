@@ -119,10 +119,13 @@ async function main() {
   const entry = path.join(REPO_ROOT, 'service', 'mcp-entry.mjs');
   log('');
   log('⑥ 给 MCP 客户端的配置（复制即用）：');
-  log(JSON.stringify({ mcpServers: { 'chrome-agent-browser': { command: 'node', args: [entry] } } }, null, 2));
+  log('npm 安装用户（推荐）：');
+  log(JSON.stringify({ mcpServers: { 'chrome-agent-browser': { command: 'chrome-agent-browser-mcp' } } }));
+  log('源码（git clone）用户：');
+  log(JSON.stringify({ mcpServers: { 'chrome-agent-browser': { command: 'node', args: [entry] } } }));
   log('');
-  log(ok ? '安装完成 🎉 日常使用只需保持 mcp-entry.mjs 由 MCP 客户端拉起即可。' : '安装文件已就位，完成第④步后即用。');
-  log('卸载：npm run uninstall');
+  log(ok ? '安装完成 🎉 日常使用：MCP 客户端按上面的配置自动拉起服务即可。' : '安装文件已就位，完成第④步后即用。');
+  log('卸载：chrome-agent-browser-uninstall（npm 安装）或 npm run uninstall（源码）');
   return ok ? 0 : 1;
 }
 

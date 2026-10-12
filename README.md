@@ -60,12 +60,17 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 「加载已解压的扩展程序」→ 粘贴剪贴板里的目录路径。验证打钩后，setup 直接给出
 可复制的 MCP 客户端配置片段（端口已自动固化，无需传参）。
 
-> 扩展 ID 由扩展目录的绝对路径决定（Chrome 的规则）：**目录一旦移动就要重跑 `npm run setup`**。
+> 扩展 ID 由扩展目录的绝对路径决定（Chrome 的规则）。**npm 全局安装的路径固定 → 升级版本 ID 不变**；
+> 源码安装的目录一旦移动就要重跑 setup 重新加载扩展。
 
-卸载：`npm run uninstall`（删本机清单与配置；Chrome 内手动移除扩展即彻底干净）。
+卸载：npm 安装用户 `chrome-agent-browser-uninstall` 后再 `npm uninstall -g chrome-agent-browser`；
+源码用户 `npm run uninstall`。两者都只删本机清单与配置，Chrome 内手动移除扩展即彻底干净。
 
-高级参数：`npm run setup -- --no-open`（不自动开 Chrome）/ `--port N` / `--timeout 秒` /
-`--browser all|chrome|edge|brave|opera|vivaldi|arc` / `--dry-run`。
+高级参数：`chrome-agent-browser -- --no-open`（不自动开 Chrome）/ `--port N` / `--timeout 秒` /
+`--browser all|chrome|edge|brave|opera|vivaldi|arc` / `--dry-run`（源码用户等价命令 `npm run setup -- …`）。
+
+更新到新版：npm 安装用户 `npm update -g chrome-agent-browser`；源码用户 `git pull && npm install`。
+两者升级后扩展无需重新加载（ID 不变），但建议重跑一次 setup 刷新配置。
 
 ## 服务生命周期（常问三问）
 
@@ -111,7 +116,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 - 支持 Chromium 系浏览器：Chrome / Edge / Brave / Opera / Vivaldi / Arc（Arc 的清单路径按 Chromium 规则实现并双写候选位置，已在无 Arc 的机器上通过安装测试；Windows 侧未实测）。Safari/Firefox 不适用。
 - Windows 分支（注册表等）已实现但未在真实 Windows 上测试过。
 - 剪贴板写入返回「不支持，请用定位器输入」（诚实报错）；`downloads.open` 需 Chrome 可选权限；嵌套 iframe 内的元素定位暂不支持。
-- 扩展 ID 依赖目录绝对路径：目录移动后需重跑 `npm run setup`（发布到 Chrome 商店后此限制消失）。
+- 扩展 ID 依赖目录绝对路径：源码安装挪目录后需重跑 setup 并重新加载扩展；npm 全局安装不受影响（路径固定）。发布到 Chrome 商店后此限制彻底消失。
 
 ## 测试
 
