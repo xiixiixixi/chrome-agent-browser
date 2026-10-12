@@ -56,6 +56,10 @@ assert.equal(install.status, 0, `安装器失败: ${install.stderr}${install.std
 const writtenManifests = (install.stdout.match(/^WRITE-MANIFEST .+$/gm) || []).map((l) => l.slice('WRITE-MANIFEST '.length).trim());
 console.log(`[e2e] 安装器写入 ${writtenManifests.length} 份清单`);
 
+// 保护用户真实配置：安装器会重写 host/host-config.json，测试结束需还原
+const hostConfigPath = join(ROOT, 'host', 'host-config.json');
+const hostConfigBackup = existsSync(hostConfigPath) ? readFileSync(hostConfigPath, 'utf8') : null;
+
 // ---- 2. 一次性浏览器环境 ----
 const udd = mkdtempSync(join(tmpdir(), 'ab-e2e-'));
 // 双保险：自定义 user-data-dir 下也放一份清单（Chromium 自定义目录时的查找位置）
@@ -175,6 +179,8 @@ try {
   let leftover = 0;
   for (const p of writtenManifests) { try { if (existsSync(p)) { leftover++; rmSync(p, { force: true }); } } catch { /* noop */ } }
   if (leftover) console.log(`[e2e] 警告：清理竞态残留 ${leftover} 份清单，已终扫删除`);
+  // 还原用户真实 host-config（安装器在测试中重写了端口）
+  if (hostConfigBackup !== null) writeFileSync(hostConfigPath, hostConfigBackup);
   console.log(`[e2e] 清理完成（浏览器/服务/测试页/临时目录/${writtenManifests.length} 份清单）`);
 }
 

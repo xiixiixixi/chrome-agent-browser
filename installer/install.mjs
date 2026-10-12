@@ -170,6 +170,39 @@ export const BROWSERS = {
       userDataDirectorySegments: ['Vivaldi', 'User Data'],
     },
   },
+  // Arc（The Browser Company，Chromium 内核）。本机未装 Arc，路径按 Chromium
+  // 「用户数据目录下 NativeMessagingHosts」规则 + 公开资料实现；macOS 双写两个
+  // 候选位置做保险；Windows 结构未实测。装了 Arc 的机器跑 npm run setup 即验证。
+  arc: {
+    displayName: 'Arc',
+    backendCompatibilityKey: 'chrome',
+    userAgentIdentifiers: ['Arc/', 'Chrome/'],
+    internalUrlSchemes: ['arc', 'chrome'],
+    extensionManagementUrl: 'chrome://extensions',
+    linux: {
+      commands: [],
+      nativeMessagingManifestDirectories: [],
+      processNames: [],
+      userDataDirectorySegments: [],
+    },
+    macos: {
+      applicationNames: ['Arc.app'],
+      bundleId: 'company.thebrowser.Browser',
+      nativeMessagingManifestDirectories: [
+        'Library/Application Support/Arc/User Data/NativeMessagingHosts',
+        'Library/Application Support/Arc/NativeMessagingHosts',
+      ],
+      processNames: ['Arc', 'Arc Helper'],
+      userDataDirectorySegments: ['Library', 'Application Support', 'Arc', 'User Data'],
+    },
+    windows: {
+      commandNames: ['Arc.exe', 'arc'],
+      registryRoot: 'HKCU\\Software\\TheBrowserCompany\\Arc\\NativeMessagingHosts',
+      installPathSegments: ['TheBrowserCompany', 'Arc', 'Application', 'Arc.exe'],
+      processNames: ['Arc.exe'],
+      userDataDirectorySegments: ['TheBrowserCompany', 'Arc', 'User Data'],
+    },
+  },
 };
 
 export const FAMILY_NAMES = Object.keys(BROWSERS);
