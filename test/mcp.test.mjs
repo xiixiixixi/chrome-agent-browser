@@ -21,7 +21,7 @@ const REAL_PNG_B64 =
 const ALL_TOOLS = [
   'ab_list_browsers', 'ab_status', 'ab_visibility', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
   'ab_screenshot', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open',
-  'ab_confirm', 'browser_eval',
+  'ab_confirm', 'ab_webmcp', 'browser_eval',
 ];
 
 /** 起 MCP 栈：service 组装（同 service.test.mjs，简化）+ MCP server/client 对连 + 伪扩展。 */
@@ -69,13 +69,61 @@ async function startMcpStack(mockOpts = {}) {
   return { manager, policy, api, server, client, mock, call, callJson, close };
 }
 
-test('tools/list 包含全部 12 个工具', async () => {
+test('tools/list 包含全部工具（ab_* + browser_eval）', async () => {
   const s = await startMcpStack();
   try {
     const res = await s.client.listTools();
     const names = res.tools.map((t) => t.name);
     for (const n of ALL_TOOLS) assert.ok(names.includes(n), `缺少工具: ${n}`);
     assert.equal(names.length, ALL_TOOLS.length);
+  } finally { await s.close(); }
+});
+
+test('ab_webmcp：list → 只读 invoke 直通 → 非只读确认流（ab_confirm 放行）', async () => {
+  const s = await startMcpStack();
+  try {
+    const { tabId } = await s.callJson('ab_new_tab', {});
+    // list：页面申报的两个工具（mock 默认应答）
+    const list = await s.callJson('ab_webmcp', { action: 'list', tabId });
+    assert.equal(list.tabId, tabId);
+    assert.equal(list.tools.length, 2);
+    assert.deepEqual(list.tools.map((t) => [t.name, t.readOnly]), [['get_time', true], ['set_note', false]]);
+    assert.ok(s.mock.calls.some((c) => c.method === 'webmcp_list_tools' && c.params.tabId === tabId));
+
+    // 只读工具直通
+    const ro = await s.callJson('ab_webmcp', { action: 'invoke', tabId, name: 'get_time' });
+    assert.equal(ro.ok, true);
+    assert.deepEqual(ro.result, { invoked: 'get_time', args: {} });
+
+    // 非只读工具：首次 needConfirmation（命令不出门）
+    const need = await s.callJson('ab_webmcp', { action: 'invoke', tabId, name: 'set_note', args: { text: 'hi' } });
+    assert.equal(need.needConfirmation, true);
+    assert.match(need.description, /set_note/);
+    assert.ok(!s.mock.calls.some((c) => c.method === 'webmcp_invoke_tool' && c.params.name === 'set_note'));
+
+    // ab_confirm → 带 token 重试放行
+    const conf = await s.callJson('ab_confirm', { token: need.token });
+    assert.equal(conf.ok, true);
+    const done = await s.callJson('ab_webmcp', { action: 'invoke', tabId, name: 'set_note', args: { text: 'hi' }, confirmationToken: need.token });
+    assert.equal(done.ok, true);
+    assert.deepEqual(done.result, { invoked: 'set_note', args: { text: 'hi' } });
+    assert.ok(s.mock.calls.some((c) => c.method === 'webmcp_invoke_tool' && c.params.name === 'set_note'));
+  } finally { await s.close(); }
+});
+
+test('ab_webmcp：不支持 WebMCP 的浏览器返回 -32011 结构化错误', async () => {
+  const s = await startMcpStack({
+    handlers: {
+      webmcp_list_tools: () => ({ __error: { code: -32011, message: '此浏览器不支持 WebMCP（需要更新版 Chrome / 实验开关）' } }),
+    },
+  });
+  try {
+    const { tabId } = await s.callJson('ab_new_tab', {});
+    const res = await s.call('ab_webmcp', { action: 'list', tabId });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content.find((c) => c.type === 'text').text);
+    assert.equal(parsed.code, -32011);
+    assert.match(parsed.error, /WebMCP/);
   } finally { await s.close(); }
 });
 

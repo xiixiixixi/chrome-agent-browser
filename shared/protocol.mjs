@@ -78,6 +78,11 @@ export const COMMANDS = {
   tab_cdp_call: { params: { tabId: 'number', method: 'string', params: 'object?' }, returns: { result: 'any' } },
   tab_cdp_events: { params: { tabId: 'number', afterSequence: 'number?', limit: 'number?' }, returns: { events: 'array', cursor: 'number' } },
 
+  // WebMCP: tools declared by the page itself (discovered via CDP WebMCP domain)
+  // returns.tools: [{name, description, inputSchema, readOnly}]
+  webmcp_list_tools: { params: { tabId: 'number' }, returns: { tools: 'array' } },
+  webmcp_invoke_tool: { params: { tabId: 'number', name: 'string', args: 'object?' }, returns: { result: 'any' } },
+
   // downloads (approval-gated in service)
   download_config_specs: { params: {} },
   download_open: { params: { downloadId: 'number' } },
@@ -102,6 +107,8 @@ export const CDP_ALLOWLIST = new Set([
   'Accessibility.enable', 'Accessibility.disable', 'Accessibility.getFullAXTree',
   'Target.getTargets', 'Target.getTargetInfo', 'Target.setAutoAttach', 'Target.closeTarget',
   'Fetch.enable', 'Fetch.disable', 'Fetch.continueRequest', 'Fetch.failRequest', 'Fetch.fulfillRequest',
+  // WebMCP (page-declared tools; experimental CDP domain, Chrome ~156+)
+  'WebMCP.enable', 'WebMCP.disable', 'WebMCP.invokeTool', 'WebMCP.cancelInvocation',
 ]);
 
 // JSON-RPC error codes
@@ -116,6 +123,7 @@ export const ERR = {
   NOT_ATTACHED: -32005,
   NAVIGATION_BLOCKED: -32006,
   POLICY_BLOCKED: -32007,   // confirmation/safety gate
+  WEBMCP_UNSUPPORTED: -32011, // browser has no WebMCP CDP domain (needs newer Chrome / experimental flag)
 };
 
 // ---- 多实例共用（frontend 模式，v1）----

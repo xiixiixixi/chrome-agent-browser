@@ -79,6 +79,21 @@ export class Policy {
       }
       return { allowed: true };
     }
+    if (kind === 'webmcp_invoke') {
+      // 页面自声明工具：页面内容不可信，readOnly 标注之外的动作（写状态/提交/下单等）需人工确认
+      if (input.readOnly === true) return { allowed: true };
+      if (this.rules.confirmActions.includes('webmcp_invoke')) {
+        const name = String(input.name ?? '?');
+        const desc = String(input.description ?? '').slice(0, 200);
+        return this._confirm(
+          'webmcp_invoke',
+          `调用页面申报的非只读 WebMCP 工具「${name}」${desc ? `：${desc}` : ''}（该工具由网页自己声明，可能修改页面/站点状态）`,
+          input,
+          opts,
+        );
+      }
+      return { allowed: true };
+    }
     // fail-closed：未知 kind 一律拒绝（规格书 §11 精神）
     return { allowed: false, code: 'POLICY_BLOCKED', reason: `unknown policy kind: ${String(kind)}` };
   }
@@ -116,7 +131,7 @@ export class Policy {
 
   _stableAction(input) {
     const out = { kind: input.kind };
-    for (const k of ['url', 'method', 'downloadId']) if (input[k] !== undefined) out[k] = input[k];
+    for (const k of ['url', 'method', 'downloadId', 'name']) if (input[k] !== undefined) out[k] = input[k];
     return out;
   }
 

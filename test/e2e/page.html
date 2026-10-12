@@ -16,5 +16,28 @@
     });
     window.__e2eMarker = 'loaded';
   </script>
+  <script>
+    // WebMCP 工具声明（按 2026 WebMCP 页面 JS API：document.modelContext.registerTool）。
+    // document.modelContext 仅在浏览器开实验开关（--enable-experimental-web-platform-features）
+    // 时存在；未启用时静默跳过，页面其余功能不受影响（E2E 的 webmcp 用例据此条件跳过）。
+    (function () {
+      if (!document.modelContext || typeof document.modelContext.registerTool !== 'function') return;
+      document.modelContext.registerTool({
+        name: 'ab_echo',
+        description: '回显消息（只读探测工具）',
+        inputSchema: { type: 'object', properties: { msg: { type: 'string' } }, required: ['msg'] },
+        async execute({ msg }) { return { content: [{ type: 'text', text: 'echo:' + msg }] }; }
+      }).catch(() => {});
+      document.modelContext.registerTool({
+        name: 'ab_set_status',
+        description: '把页面状态文本设为给定值（非只读）',
+        inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+        async execute({ text }) {
+          document.getElementById('out').textContent = 'webmcp:' + text;
+          return { content: [{ type: 'text', text: 'set' }] };
+        }
+      }).catch(() => {});
+    })();
+  </script>
 </body>
 </html>

@@ -215,6 +215,60 @@ test('page 事件更新 tab 缓存；tab 关闭/移除后所有方法抛错', as
   } finally { mock.close(); await manager.stop(); }
 });
 
+test('webmcp capability：list 透传 / 只读直通 / 非只读过确认门（approve 后放行）', async () => {
+  const { manager, api, policy } = await startStack();
+  const mock = await connectMock(manager);
+  try {
+    const tab = await api.browsers.getDefault().tabs.new({});
+    assert.deepEqual(tab.capabilities.list(), ['cdp', 'webmcp']);
+    assert.equal(tab.capabilities.get('nope'), null);
+    const webmcp = tab.capabilities.get('webmcp');
+
+    const tools = await webmcp.list();
+    assert.equal(tools.length, 2);
+    assert.deepEqual(mock.calls.find((c) => c.method === 'webmcp_list_tools').params, { tabId: tab.id });
+    assert.deepEqual(tools.map((t) => [t.name, t.readOnly]), [['get_time', true], ['set_note', false]]);
+
+    // 只读工具：直通，命令直达扩展
+    const r1 = await webmcp.invoke('get_time', {});
+    assert.deepEqual(r1, { invoked: 'get_time', args: {} });
+
+    // 非只读工具：首次被拦（needsConfirmation，命令不出门）
+    let token = null;
+    await assert.rejects(webmcp.invoke('set_note', { text: 'hi' }), (err) => {
+      assert.equal(err.needsConfirmation, true);
+      assert.match(err.description, /set_note/);
+      token = err.token;
+      return true;
+    });
+    assert.ok(!mock.calls.some((c) => c.method === 'webmcp_invoke_tool' && c.params.name === 'set_note'));
+
+    // approve → 带 token 重试放行
+    assert.equal(policy.approve(token).ok, true);
+    const r2 = await webmcp.invoke('set_note', { text: 'hi' }, { confirmationToken: token });
+    assert.deepEqual(r2, { invoked: 'set_note', args: { text: 'hi' } });
+    assert.deepEqual(mock.calls.filter((c) => c.method === 'webmcp_invoke_tool').at(-1).params, {
+      tabId: tab.id, name: 'set_note', args: { text: 'hi' },
+    });
+  } finally { mock.close(); await manager.stop(); }
+});
+
+test('webmcp：不支持的浏览器（-32011）错误码透传到 api 层', async () => {
+  const { manager, api } = await startStack();
+  const mock = await connectMock(manager, {
+    handlers: {
+      webmcp_list_tools: () => ({ __error: { code: ERR.WEBMCP_UNSUPPORTED, message: '此浏览器不支持 WebMCP（需要更新版 Chrome / 实验开关）' } }),
+    },
+  });
+  try {
+    const tab = await api.browsers.getDefault().tabs.new({});
+    await assert.rejects(
+      tab.capabilities.get('webmcp').list(),
+      (err) => err.code === ERR.WEBMCP_UNSUPPORTED && /WebMCP/.test(err.message),
+    );
+  } finally { mock.close(); await manager.stop(); }
+});
+
 test('断连保留镜像租约，同 instanceId 重连恢复', async () => {
   const { manager, api } = await startStack();
   const mock = await connectMock(manager);

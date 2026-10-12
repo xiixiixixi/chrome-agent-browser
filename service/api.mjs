@@ -96,7 +96,7 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
 
   function wrapBrowser(conn) {
     if (wrapped.has(conn)) return wrapped.get(conn);
-    const state = { sessionId: null, turnId: null, tabCount: 0, pageCache: new Map(), tabs: new Map() };
+    const state = { sessionId: null, turnId: null, tabCount: 0, pageCache: new Map(), tabs: new Map(), webmcpCache: new Map() };
 
     // page 事件 → tab 缓存 {url,title,removed}
     conn.on('page', (p) => {
@@ -188,29 +188,59 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
         },
         playwright: createPlaywright(null), // 占位，下面回填 tab 引用
         capabilities: {
-          list: () => ['cdp'],
+          list: () => ['cdp', 'webmcp'],
           get: (id) => {
-            if (id !== 'cdp') return null;
+            if (id !== 'cdp' && id !== 'webmcp') return null;
+            if (id === 'cdp') {
+              return {
+                async send(method, params = {}, opts = {}) {
+                  z.string().min(1).parse(method);
+                  if (typeof params !== 'object' || params === null) throw new TypeError('params must be an object');
+                  if (!CDP_ALLOWLIST.has(method)) { // 服务端预检：默认拒绝
+                    const e = new Error(`CDP method not allowed: ${method}`);
+                    e.code = ERR.CDP_DENIED;
+                    throw e;
+                  }
+                  checkPolicy({ kind: 'cdp', method }, { confirmationToken: opts.confirmationToken });
+                  const r = await call('tab_cdp_call', { tabId, method, params });
+                  return r.result;
+                },
+                async readEvents({ afterSequence, limit } = {}) {
+                  const r = await call('tab_cdp_events', {
+                    tabId,
+                    ...(afterSequence !== undefined ? { afterSequence } : {}),
+                    ...(limit !== undefined ? { limit } : {}),
+                  });
+                  return { events: r.events ?? [], cursor: r.cursor ?? 0 };
+                },
+              };
+            }
+            // 'webmcp'：页面自声明工具的发现与受控调用（发现只读；调用过策略门）
             return {
-              async send(method, params = {}, opts = {}) {
-                z.string().min(1).parse(method);
-                if (typeof params !== 'object' || params === null) throw new TypeError('params must be an object');
-                if (!CDP_ALLOWLIST.has(method)) { // 服务端预检：默认拒绝
-                  const e = new Error(`CDP method not allowed: ${method}`);
-                  e.code = ERR.CDP_DENIED;
-                  throw e;
-                }
-                checkPolicy({ kind: 'cdp', method }, { confirmationToken: opts.confirmationToken });
-                const r = await call('tab_cdp_call', { tabId, method, params });
-                return r.result;
+              /** 列出页面申报的工具：[{name, description, inputSchema?, readOnly}]。 */
+              async list() {
+                const r = await call('webmcp_list_tools', { tabId });
+                state.webmcpCache.set(tabId, new Map((r.tools ?? []).filter((t) => t && typeof t.name === 'string').map((t) => [t.name, t])));
+                return r.tools ?? [];
               },
-              async readEvents({ afterSequence, limit } = {}) {
-                const r = await call('tab_cdp_events', {
-                  tabId,
-                  ...(afterSequence !== undefined ? { afterSequence } : {}),
-                  ...(limit !== undefined ? { limit } : {}),
-                });
-                return { events: r.events ?? [], cursor: r.cursor ?? 0 };
+              /**
+               * 调用页面工具。readOnly 工具直通；非 readOnly（含未知工具，保守）过
+               * policy 的 webmcp_invoke 确认门——首次抛 needsConfirmation（带 token），
+               * approve 后带 opts.confirmationToken 重试放行。
+               */
+              async invoke(name, args = {}, opts = {}) {
+                z.string().min(1).parse(name);
+                if (typeof args !== 'object' || args === null || Array.isArray(args)) throw new TypeError('args must be an object');
+                let meta = state.webmcpCache.get(tabId)?.get(name);
+                if (!meta) { await this.list(); meta = state.webmcpCache.get(tabId)?.get(name); } // 缓存缺失（list 未调过）→ 先刷新
+                const readOnly = !!(meta && meta.readOnly);
+                checkPolicy({
+                  kind: 'webmcp_invoke', name,
+                  description: (meta && meta.description) || '',
+                  readOnly,
+                }, { confirmationToken: opts.confirmationToken });
+                const r = await call('webmcp_invoke_tool', { tabId, name, ...(Object.keys(args).length ? { args } : {}) });
+                return r.result;
               },
             };
           },

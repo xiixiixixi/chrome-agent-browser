@@ -66,7 +66,7 @@ function fmtValue(v) {
 }
 
 /**
- * 构建 MCP 服务器（12 个工具）。
+ * 构建 MCP 服务器（13 个工具）。
  * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null}} opts
  *   api         —— createAgentApi 的返回值（必填）
  *   policy      —— service/policy.mjs 的 Policy 实例（缺省时跳过工具层策略，api 层仍可能拦）
@@ -76,7 +76,7 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   if (!api || typeof api.browsers?.getDefault !== 'function') {
     throw new TypeError('buildMcpServer requires { api } — createAgentApi() 的返回对象');
   }
-  const server = new McpServer({ name: 'chrome-agent-browser', version: '0.1.0' });
+  const server = new McpServer({ name: 'chrome-agent-browser', version: '0.2.0' });
 
   // tabId → { browser, tab }：new/claim 时登记；未知 tabId 跨浏览器探测后缓存
   const tabRegistry = new Map();
@@ -334,6 +334,37 @@ export function buildMcpServer({ api, policy = null, connections = null, service
       return textResult({ ok: false, reason: 'policy not configured' });
     }
     return textResult(policy.approve(token)); // {ok:true,description} | {ok:false,reason}
+  }));
+
+  // ---- 11b. ab_webmcp（页面自声明 WebMCP 工具） ----
+  server.registerTool('ab_webmcp', {
+    title: 'WebMCP：发现/调用页面申报的工具',
+    description: '调用网页按 WebMCP 标准自己申报的结构化工具（页面 JS API document.modelContext.registerTool）。用法：先 action=list 看页面申报了什么工具（返回 name/description/inputSchema/readOnly）；再 action=invoke 调用。readOnly=true 的工具直接调用；readOnly=false（页面未标注的也算 false）首次会返回 {needConfirmation,description,token}——经 ab_confirm 批准后带 confirmationToken 重试同一调用即放行（页面声明的工具可能改站点状态，故非只读需确认）。旧版 Chrome 无 WebMCP 域时返回 code=-32011 的错误。',
+    inputSchema: {
+      action: z.enum(['list', 'invoke']).describe('list=列出页面申报的工具；invoke=调用一个工具'),
+      tabId: z.number().int().describe('标签页 id（ab_new_tab/ab_claim_tab 返回）'),
+      name: z.string().min(1).optional().describe('action=invoke 时必填：工具名（来自 list 结果）'),
+      args: z.record(z.any()).optional().describe('action=invoke 时的工具入参（按 inputSchema 构造）'),
+      confirmationToken: z.string().optional().describe('ab_confirm 批准后的一次性令牌（非只读工具第二次调用时带）'),
+    },
+  }, guard(async ({ action, tabId, name, args, confirmationToken }) => {
+    const { tab } = await resolveTab(tabId);
+    const webmcp = tab.capabilities.get('webmcp');
+    if (!webmcp) return textResult({ blocked: true, reason: 'browser has no webmcp capability' });
+    if (action === 'list') {
+      const tools = await webmcp.list();
+      return textResult({ tabId, tools });
+    }
+    if (!name) throw new Error('action=invoke 需要 name（先 action=list 查看页面申报的工具名）');
+    try {
+      const result = await webmcp.invoke(name, args ?? {}, confirmationToken ? { confirmationToken } : {});
+      return textResult({ ok: true, tabId, name, result });
+    } catch (err) {
+      if (err && err.needsConfirmation) {
+        return textResult({ needConfirmation: true, description: err.description, token: err.token });
+      }
+      throw err; // guard 统一转结构化错误（含 -32011 不支持等）
+    }
   }));
 
   // ---- 12. browser_eval（REPL，本项目核心特色） ----

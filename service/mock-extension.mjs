@@ -69,6 +69,17 @@ function defaultHandler(method, params, respond, fail) {
     case 'tab_cdp_events':
       respond({ events: [], cursor: 0 });
       return;
+    case 'webmcp_list_tools':
+      respond({
+        tools: [
+          { name: 'get_time', description: '读取当前时间（只读）', inputSchema: { type: 'object', properties: {} }, readOnly: true },
+          { name: 'set_note', description: '写入便签（非只读）', inputSchema: { type: 'object', properties: { text: { type: 'string' } } }, readOnly: false },
+        ],
+      });
+      return;
+    case 'webmcp_invoke_tool':
+      respond({ result: { invoked: params.name, args: params.args ?? {} } });
+      return;
     default:
       fail(-32601, `mock does not support command: ${method}`);
   }

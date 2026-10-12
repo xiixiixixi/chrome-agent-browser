@@ -21,7 +21,7 @@ const HOST_NAME = 'com.chromeagentbrowser.host'; // native messaging 宿主名�
 const ALARM_RECONNECT = 'ab-reconnect';
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000]; // 重连退避，30s 封顶
 const REQ_TIMEOUT_MS = 20000;   // 出站 JSON-RPC 请求超时
-const CAPABILITIES = ['cdp', 'screenshot', 'ax', 'locator', 'history', 'downloads', 'dialogs', 'viewport'];
+const CAPABILITIES = ['cdp', 'screenshot', 'ax', 'locator', 'history', 'downloads', 'dialogs', 'viewport', 'webmcp'];
 const LEASE_KEY = 'ab_leases';      // chrome.storage.session
 const SESSION_KEY = 'ab_session';   // chrome.storage.session
 const VIEWPORT_KEY = 'ab_viewport'; // chrome.storage.session
@@ -29,6 +29,8 @@ const BADGE_COLOR = '#f59e0b';      // agent 持有标签页的角标颜色（am
 const MAX_CDP_EVENTS = 500;         // 每 tab CDP 事件环容量
 const MAX_DEV_LOGS = 200;           // 每 tab 控制台日志环容量
 const SNAPSHOT_MAX = 200 * 1024;    // locator_snapshot 截断 200KB
+const WEBMCP_LIST_WAIT_MS = 2000;   // WebMCP.enable 后等 toolsAdded 事件的上限
+const WEBMCP_INVOKE_WAIT_MS = 12000;// 等页面工具 execute 完成的上限（须低于 service 命令 15s 超时）
 
 // JSON-RPC 错误码（拷贝自 shared/protocol.mjs ERR）
 const ERR = {
@@ -41,6 +43,7 @@ const ERR = {
   NOT_ATTACHED: -32005,
   NAVIGATION_BLOCKED: -32006,
   POLICY_BLOCKED: -32007,
+  WEBMCP_UNSUPPORTED: -32011,
 };
 
 // 事件名（拷贝自 shared/protocol.mjs EV；扩展只发通知，无 id）
@@ -75,6 +78,7 @@ const CDP_ALLOWLIST = new Set([
   'Accessibility.enable', 'Accessibility.disable', 'Accessibility.getFullAXTree',
   'Target.getTargets', 'Target.getTargetInfo', 'Target.setAutoAttach', 'Target.closeTarget',
   'Fetch.enable', 'Fetch.disable', 'Fetch.continueRequest', 'Fetch.failRequest', 'Fetch.fulfillRequest',
+  'WebMCP.enable', 'WebMCP.disable', 'WebMCP.invokeTool', 'WebMCP.cancelInvocation',
 ]);
 
 // 运行态（易失；权威数据在 chrome.storage，见文件头注释）
@@ -94,6 +98,9 @@ const st = {
   logRings: new Map(),      // tabId -> [{ts,level,text}]
   dialogs: new Map(),       // tabId -> Page.javascriptDialogOpening params
   axNodes: new Map(),       // tabId -> [{idx, backendDOMNodeId}]
+  webmcpTools: new Map(),        // tabId -> Map(name -> CDP WebMCP.Tool)
+  webmcpAddedWaiters: new Map(), // tabId -> [resolve]（等 toolsAdded 的命令挂起处）
+  webmcpInvokeWaiters: new Map(),// invocationId -> resolve(params)（等 toolResponded）
 };
 
 function log(...args) { try { console.log('[ab]', ...args); } catch (e) { /* noop */ } }
@@ -1055,6 +1062,143 @@ async function cmdTabCdpEvents(p) {
   return out;
 }
 
+// ---- WebMCP（页面自声明工具，经 CDP WebMCP 实验域发现与调用）----
+//
+// 探测实证（Chrome for Testing 156）：域方法 WebMCP.enable / disable / invokeTool /
+// cancelInvocation；发现靠事件——enable 会补发一条 toolsAdded（含全部当前工具），
+// 之后增量 toolsAdded / toolsRemoved；invokeTool 立即回 invocationId，真正的结果在
+// toolResponded 事件（status: Completed|Canceled|Error，output 为页面 execute 的返回值）。
+// 旧版 Chrome 无此域 → chrome.debugger 报 "wasn't found" → 统一转 WEBMCP_UNSUPPORTED(-32011)。
+
+// 仅识别"域/方法不存在"类报错（如 "'WebMCP.enable' wasn't found"）；
+// 注意不能匹配 "Tool not found"（那是要调的工具不存在，不是浏览器不支持）
+function isWebmcpUnsupportedErr(e) {
+  const m = errMsg(e);
+  if (!/webmcp/i.test(m)) return false;
+  return /wasn.t found|was not found|unknown (method|command|domain)|no longer supported|unsupported/i.test(m);
+}
+
+async function webmcpSend(tabId, method, params) {
+  try {
+    return await cdpSend(tabId, method, params || {});
+  } catch (e) {
+    if (isWebmcpUnsupportedErr(e)) {
+      throw abErr(ERR.WEBMCP_UNSUPPORTED, '此浏览器不支持 WebMCP（需要更新版 Chrome / 实验开关）');
+    }
+    throw e;
+  }
+}
+
+// 工具缓存维护（由 chrome.debugger.onEvent 里的 WebMCP.* 分支调用）
+function webmcpMergeTools(tabId, params) {
+  let m = st.webmcpTools.get(tabId);
+  if (!m) { m = new Map(); st.webmcpTools.set(tabId, m); }
+  for (const t of ((params && params.tools) || [])) {
+    if (t && typeof t.name === 'string') m.set(t.name, t);
+  }
+  const ws = st.webmcpAddedWaiters.get(tabId);
+  if (ws) {
+    st.webmcpAddedWaiters.delete(tabId);
+    for (const w of ws) { try { w(); } catch (e) { /* 忽略 */ } }
+  }
+}
+
+function webmcpRemoveTools(tabId, params) {
+  const m = st.webmcpTools.get(tabId);
+  if (!m) return;
+  for (const t of ((params && params.tools) || [])) {
+    if (t && typeof t.name === 'string') m.delete(t.name);
+  }
+}
+
+// 确保 WebMCP 域已启用且缓存就绪：enable → 等 toolsAdded（至多 WEBMCP_LIST_WAIT_MS）。
+// 返回该 tab 的工具 Map（无事件 = 页面没申报工具，或页面 JS API 未启用）。
+async function webmcpRefresh(tabId) {
+  await ensureAttached(tabId);
+  let settle = null;
+  const wait = new Promise((r) => { settle = r; });
+  let arr = st.webmcpAddedWaiters.get(tabId);
+  if (!arr) { arr = []; st.webmcpAddedWaiters.set(tabId, arr); }
+  arr.push(settle);
+  try {
+    await webmcpSend(tabId, 'WebMCP.enable', {});
+    await Promise.race([wait, new Promise((r) => setTimeout(r, WEBMCP_LIST_WAIT_MS))]);
+  } finally {
+    const i = arr.indexOf(settle);
+    if (i !== -1) arr.splice(i, 1);
+    if (!arr.length) st.webmcpAddedWaiters.delete(tabId);
+  }
+  return st.webmcpTools.get(tabId) || new Map();
+}
+
+async function cmdWebmcpListTools(p) {
+  const tools = await webmcpRefresh(p.tabId);
+  const out = [];
+  for (const t of tools.values()) {
+    out.push({
+      name: String(t.name || ''),
+      description: String(t.description || ''),
+      ...(t.inputSchema && typeof t.inputSchema === 'object' ? { inputSchema: t.inputSchema } : {}),
+      readOnly: !!(t.annotations && t.annotations.readOnly), // 声明里没标就 false（保守）
+    });
+  }
+  if (!out.length) {
+    // 空列表时给一条可操作诊断：页面 API 是否启用（document.modelContext）
+    try {
+      const r = await cdpSend(p.tabId, 'Runtime.evaluate', {
+        expression: '(typeof document !== "undefined") && !!document.modelContext',
+        returnByValue: true,
+      });
+      if (!(r && r.result && r.result.value === true)) {
+        return { tools: out, hint: '页面未申报任何 WebMCP 工具；此浏览器的 WebMCP 页面 API 未启用（需实验开关 --enable-experimental-web-platform-features 或更新版 Chrome），或当前页面确实没有申报' };
+      }
+    } catch (e) { /* 诊断失败不影响主结果 */ }
+  }
+  return { tools: out };
+}
+
+async function cmdWebmcpInvokeTool(p) {
+  await ensureAttached(p.tabId);
+  let tool = null;
+  const cached = st.webmcpTools.get(p.tabId);
+  if (cached) tool = cached.get(p.name);
+  if (!tool) {
+    tool = (await webmcpRefresh(p.tabId)).get(p.name); // SW 重启/首次调用缓存缺失 → 刷新
+  }
+  if (!tool) {
+    throw abErr(ERR.INVALID_PARAMS, 'WebMCP tool not found: ' + p.name + '（先 webmcp_list_tools 刷新页面申报）');
+  }
+  // invokeTool 必须给工具所属 frame；缓存缺 frameId 时回退主 frame
+  let frameId = tool.frameId || null;
+  if (!frameId) {
+    const ft = await cdpSend(p.tabId, 'Page.getFrameTree', {});
+    frameId = ft && ft.frameTree && ft.frameTree.frame && ft.frameTree.frame.id;
+  }
+  const inv = await webmcpSend(p.tabId, 'WebMCP.invokeTool', {
+    frameId, toolName: p.name, input: p.args || {},
+  });
+  const invocationId = inv && inv.invocationId;
+  if (!invocationId) throw abErr(ERR.INTERNAL, 'WebMCP.invokeTool 未返回 invocationId');
+  // 结果异步到达（WebMCP.toolResponded 事件），等待上限须低于 service 的 15s 命令超时
+  const resp = await new Promise((resolve) => {
+    st.webmcpInvokeWaiters.set(String(invocationId), resolve);
+    setTimeout(() => {
+      if (st.webmcpInvokeWaiters.delete(String(invocationId))) resolve(null);
+    }, WEBMCP_INVOKE_WAIT_MS);
+  });
+  if (!resp) {
+    try { await webmcpSend(p.tabId, 'WebMCP.cancelInvocation', { invocationId }); } catch (e) { /* 已结束则忽略 */ }
+    throw abErr(ERR.INTERNAL, 'WebMCP 工具 ' + WEBMCP_INVOKE_WAIT_MS + 'ms 内未响应: ' + p.name);
+  }
+  if (resp.status === 'Completed') {
+    return { result: resp.output === undefined ? null : resp.output };
+  }
+  const detail = resp.errorText
+    || (resp.exception && (resp.exception.description || resp.exception.value))
+    || resp.status || 'error';
+  throw abErr(ERR.INTERNAL, 'WebMCP 工具 ' + p.name + ' 失败: ' + String(detail));
+}
+
 // ---- 下载 ----
 
 async function cmdDownloadConfigSpecs() {
@@ -1112,6 +1256,9 @@ const REGISTRY = {
 
   tab_cdp_call: { spec: { tabId: 'number', method: 'string', params: 'object?' }, fn: cmdTabCdpCall },
   tab_cdp_events: { spec: { tabId: 'number', afterSequence: 'number?', limit: 'number?' }, fn: cmdTabCdpEvents },
+
+  webmcp_list_tools: { spec: { tabId: 'number' }, fn: cmdWebmcpListTools },
+  webmcp_invoke_tool: { spec: { tabId: 'number', name: 'string', args: 'object?' }, fn: cmdWebmcpInvokeTool },
 
   download_config_specs: { spec: {}, fn: cmdDownloadConfigSpecs },
   download_open: { spec: { downloadId: 'number' }, fn: cmdDownloadOpen },
@@ -1172,6 +1319,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   st.logRings.delete(tabId);
   st.dialogs.delete(tabId);
   st.axNodes.delete(tabId);
+  st.webmcpTools.delete(tabId);
   await dropLease(tabId); // 广播 onLeaseChange{tabId, lease:null}
   sendNotification(EV.PAGE, { tabId, event: 'removed' });
 });
@@ -1189,6 +1337,21 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     pushDevLog(tabId, (params && params.type) || 'log', argsToText(params && params.args));
   } else if (method === 'Runtime.exceptionThrown') {
     pushDevLog(tabId, 'error', exceptionToText(params && params.exceptionDetails));
+  }
+  // WebMCP：工具增删缓存 + 命令等待器唤醒（toolsAdded/toolsRemoved/toolResponded）
+  if (method === 'WebMCP.toolsAdded') {
+    webmcpMergeTools(tabId, params);
+  } else if (method === 'WebMCP.toolsRemoved') {
+    webmcpRemoveTools(tabId, params);
+  } else if (method === 'WebMCP.toolResponded') {
+    const key = String((params && params.invocationId) || '');
+    const w = st.webmcpInvokeWaiters.get(key);
+    if (w) {
+      st.webmcpInvokeWaiters.delete(key);
+      try { w(params || {}); } catch (e) { /* 忽略 */ }
+    }
+  } else if (method === 'Page.frameNavigated' && params && params.frame && !params.frame.parentId) {
+    st.webmcpTools.delete(tabId); // 主文档换页：旧文档申报的工具全部失效
   }
   pushCdpEvent(tabId, method, params);
   sendNotification(EV.CDP, { tabId, method, params: params || {} });

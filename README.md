@@ -8,7 +8,7 @@
 ┌─ 5 ─ MCP 客户端（任意支持 MCP 的 AI 工具）
 │        │ MCP over stdio（JSON-RPC 2.0）           ← service/mcp-entry.mjs（入口）
 │        ▼
-├─ 4 ─ MCP 工具面  service/mcp.mjs：12 个工具（ab_* 粗粒度 + browser_eval REPL）
+├─ 4 ─ MCP 工具面  service/mcp.mjs：13 个工具（ab_* 粗粒度 + browser_eval REPL）
 │        ▼
 ├─ 3 ─ service 命令层  service/api.mjs（Agent API）+ policy.mjs（策略门）
 │        + connection.mjs（WS 服务端 / 租约镜像 / 心跳）
@@ -83,7 +83,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
   端口已占用后自动切换为「前端模式」连接既有服务，共享同一个浏览器连接；全部客户端退出后
   最后一个 service 进程退出，不留孤儿进程。
 
-## MCP 工具面（12 个）
+## MCP 工具面（13 个）
 
 | 工具 | 作用 |
 |---|---|
@@ -95,6 +95,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | `ab_claim_tab` | 认领一个已开的用户标签页（标题/网址三重匹配，防认错） |
 | `ab_cdp` / `ab_download_open` | 原样 CDP（白名单+确认门）/ 打开下载文件（确认门） |
 | `ab_confirm` | 批准一次待确认动作（5 分钟一次性令牌） |
+| `ab_webmcp` | **WebMCP**：发现/调用网页自己申报的结构化工具（`action:list\|invoke`；非只读工具过确认门） |
 | `browser_eval` | **核心特色**：给 agent 一段代码，内含完整 API 对象 `agent`，一次完成「看页面→操作→验证」循环 |
 
 ## 安全模型
@@ -121,7 +122,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 ## 测试
 
 ```bash
-npm test          # 37 个单元测试
+npm test          # 55 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
 npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听，逐项给修复建议
 npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome）

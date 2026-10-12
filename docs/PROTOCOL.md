@@ -42,9 +42,20 @@ service (service/service.mjs) ——命令层 + 租约镜像 + MCP 服务器
 
 ## 5. CDP 直通
 
-- `tab_cdp_call` 白名单在 shared/protocol.mjs `CDP_ALLOWLIST`（默认拒绝）。
+- `tab_cdp_call` 白名单在 shared/protocol.mjs `CDP_ALLOWLIST`（默认拒绝）；含实验域 `WebMCP.*`。
 - 原始事件环：扩展按 tabId 缓冲（环形，每 tab 最多 500 条，带自增 sequence）；`tab_cdp_events` 游标分页，`truncated:true` 表示旧事件被逐出。
 - attach 生命周期：命令需要时自动 attach（chrome.debugger.attach(tabId,"1.3")）；租约释放/tab 关闭时 detach；收到 onDetach 事件同步状态。
+
+## 5b. WebMCP（页面自声明工具）
+
+网页按 WebMCP 标准经页面 JS API（`document.modelContext.registerTool`）申报结构化工具，服务侧两条命令发现与调用（走 CDP 实验 `WebMCP` 域，Chrome ~156+）：
+
+- `webmcp_list_tools {tabId}` → `{tools:[{name, description, inputSchema?, readOnly}], hint?}`
+  扩展侧 `WebMCP.enable` 后收 `toolsAdded` 事件构建缓存（换页/关 tab 失效）。`readOnly` 来自 CDP annotations，**声明里没标就 false**。空列表时附 `hint`（页面 JS API 未启用的诊断）。
+- `webmcp_invoke_tool {tabId, name, args?}` → `{result}`
+  扩展侧发 `WebMCP.invokeTool`（frameId 取工具申报 frame），经 `toolResponded` 事件收结果（等待上限 12s，须低于命令超时 15s；超时发 `WebMCP.cancelInvocation`）。
+- 浏览器无 WebMCP 域（旧版 Chrome）→ 错误码 `-32011 WEBMCP_UNSUPPORTED`。
+- 策略门（service 层）：`webmcp_invoke` 的 readOnly 工具放行；非 readOnly 首次返回待确认（`POLICY_BLOCKED` + 一次性 token），批准后带 `confirmationToken` 重试放行。
 
 ## 6. 安全门（service 层强制）
 

@@ -29,6 +29,7 @@ MV3 单文件 service worker（`background.js`）。它通过 Chrome Native Mess
 
 - **`tab_clipboard_write_text` 不生效**：service worker 没有 DOM 剪贴板，命令诚实返回 `{ok:false, reason:'use locator fill'}`。需要写入输入框请改用 `locator_action`（action=`fill`）。
 - **`download_open` 可能失败**：Chrome 要求 `downloads.open` 是 optional permission（本 manifest 未声明），调用失败时会原样返回错误。下载列表事件（`onDownloadChange`）不受影响。
+- **`webmcp_*` 需要浏览器支持**：WebMCP 是 Chrome 的实验 CDP 域（约 156+）。旧版 Chrome 上调用返回 -32011（WEBMCP_UNSUPPORTED）；CDP 域存在但页面 JS API（`document.modelContext`，需 `--enable-experimental-web-platform-features`）未启用时，`webmcp_list_tools` 返回空列表并附 `hint` 说明。工具调用结果经 `WebMCP.toolResponded` 事件异步回传，等待上限 12s（须低于服务端 15s 命令超时）。
 - **定位器不支持跨 frame/iframe**：`locator_*` 只在页面主文档（main frame）里查找元素。
 - AX 快照做了规模截断：深度 ≤ 12、最多 800 行；`locator_snapshot` 的 HTML 截断在 200KB。CDP 事件环每标签页最多保留最近 500 条（`tab_cdp_events` 会以 `truncated:true` 提示旧事件被逐出），控制台日志环每标签页 200 条。
 - `chrome.debugger` 是独占的：标签页开着 DevTools（或被其他自动化扩展 attach）时，涉及 CDP 的命令会返回 -32005（NOT_ATTACHED）并带原因。
