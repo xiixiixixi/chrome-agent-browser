@@ -1,0 +1,19 @@
+# 依赖与生成物
+node_modules/
+
+# 本机生成的文件（setup/installer 会重建，且含机器特定绝对路径）
+host/host-config.json
+host/chrome-agent-browser-host
+host/chrome-agent-browser-host.cmd
+host/agent-browser-host
+host/agent-browser-host.cmd
+*.bak
+
+# 内部研发笔记（不对外）
+docs/REFERENCE-MAP.md
+
+# 系统与编辑器
+.DS_Store
+*.log
+.idea/
+.vscode/

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>AB-E2E 测试页</title></head>
+<body>
+  <h1 id="title">chrome-agent-browser e2e</h1>
+  <label for="name">姓名</label>
+  <input id="name" data-testid="name-input" placeholder="输入姓名" autocomplete="off">
+  <button id="btn" data-testid="submit-btn" role="button" aria-label="提交">点我</button>
+  <a id="link" href="#done" aria-label="链接甲">链接甲</a>
+  <div id="out" role="status" aria-live="polite"></div>
+  <script>
+    // 页面被真实点击/填写后改变状态，供 E2E 断言“操作真的发生了”
+    document.getElementById('btn').addEventListener('click', () => {
+      const v = document.getElementById('name').value || '(空)';
+      document.getElementById('out').textContent = 'clicked:' + v;
+    });
+    window.__e2eMarker = 'loaded';
+  </script>
+</body>
+</html>

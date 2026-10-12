@@ -1,0 +1,6 @@
+{
+  "blockedUrlPatterns": ["chrome://settings/*", "chrome://extensions/*", "about:*"],
+  "confirmActions": ["download_open"],
+  "confirmCdp": ["Network.clearBrowserCookies", "Page.crash", "Network.setRequestInterception", "Fetch.enable"],
+  "maxTabsPerSession": 20
+}
