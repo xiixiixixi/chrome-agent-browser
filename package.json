@@ -7,10 +7,10 @@
     "node": ">=18"
   },
   "bin": {
-    "chrome-agent-browser": "./setup.mjs",
-    "chrome-agent-browser-mcp": "./service/mcp-entry.mjs",
-    "chrome-agent-browser-doctor": "./doctor.mjs",
-    "chrome-agent-browser-uninstall": "./uninstall.mjs"
+    "chrome-agent-browser": "setup.mjs",
+    "chrome-agent-browser-mcp": "service/mcp-entry.mjs",
+    "chrome-agent-browser-doctor": "doctor.mjs",
+    "chrome-agent-browser-uninstall": "uninstall.mjs"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
