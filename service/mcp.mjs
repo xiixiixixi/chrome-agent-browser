@@ -108,31 +108,42 @@ export function buildMcpServer({ api, policy = null, connections = null } = {}) 
     try { return await fn(args); } catch (err) { return textResult(errPayload(err), true); }
   };
 
+  /** 按可选 browserId 选浏览器：不给 = 默认（第一个连上的）。id 来自 ab_list_browsers。 */
+  function pickBrowser(browserId) {
+    if (browserId === undefined || browserId === null || browserId === '') return api.browsers.getDefault();
+    const b = api.browsers.get(browserId);
+    if (!b) { const e = new Error(`browser not found: ${browserId}（先跑 ab_list_browsers 看在线列表）`); e.code = -32002; throw e; }
+    return b;
+  }
+
   // ---- 1. ab_list_browsers ----
   server.registerTool('ab_list_browsers', {
     title: '列出浏览器',
-    description: '列出当前连接到 service 的浏览器实例（extension 家族，含 instanceId）。返回 {browsers:[{id,family,name,type}]}。',
+    description: '列出当前连接到 service 的浏览器实例（可同时挂多个浏览器，如 Chrome + Arc）。返回 {browsers:[{id,family,name,type}]}；把 id 作为 browserId 传给 ab_new_tab/ab_open_tabs/ab_claim_tab 即可指定目标浏览器。',
     inputSchema: {},
   }, guard(async () => textResult({ browsers: api.browsers.list() })));
 
   // ---- 2. ab_open_tabs ----
   server.registerTool('ab_open_tabs', {
     title: '列出用户打开的标签页',
-    description: '列出默认浏览器中用户当前打开的标签页（只读，不认领）。返回 {tabs:[...]}。',
-    inputSchema: {},
-  }, guard(async () => textResult({ tabs: await api.browsers.getDefault().user.openTabs() })));
+    description: '列出浏览器中用户当前打开的标签页（只读，不认领）。不给 browserId = 默认浏览器（第一个连上的）。返回 {tabs:[...]}。',
+    inputSchema: { browserId: z.string().optional().describe('目标浏览器 id（ab_list_browsers 的 id，如 Arc；缺省=默认浏览器）') },
+  }, guard(async ({ browserId }) => textResult({ tabs: await pickBrowser(browserId).user.openTabs() })));
 
   // ---- 3. ab_new_tab ----
   server.registerTool('ab_new_tab', {
     title: '新建标签页',
-    description: '在默认浏览器新建标签页（agent 会话租约自动登记）。若给 url 先过 navigate 策略，被拦返回 {blocked,reason}。成功返回 {tabId}。',
-    inputSchema: { url: z.string().min(1).optional().describe('初始 URL，可省略（about:blank）') },
-  }, guard(async ({ url }) => {
+    description: '新建标签页（agent 会话租约自动登记）。不给 browserId = 默认浏览器。若给 url 先过 navigate 策略，被拦返回 {blocked,reason}。成功返回 {tabId}。',
+    inputSchema: {
+      url: z.string().min(1).optional().describe('初始 URL，可省略（about:blank）'),
+      browserId: z.string().optional().describe('目标浏览器 id（ab_list_browsers 的 id，如 Arc；缺省=默认浏览器）'),
+    },
+  }, guard(async ({ url, browserId }) => {
     if (url !== undefined) {
       const v = policyCheck({ kind: 'navigate', url });
       if (!v.allowed) return textResult({ blocked: true, reason: v.reason, code: v.code ?? 'POLICY_BLOCKED' });
     }
-    const browser = api.browsers.getDefault();
+    const browser = pickBrowser(browserId);
     const tab = await browser.tabs.new(url !== undefined ? { url } : {});
     tabRegistry.set(tab.id, { browser, tab });
     return textResult({ tabId: tab.id });
@@ -205,9 +216,10 @@ export function buildMcpServer({ api, policy = null, connections = null } = {}) 
       providerTabId: z.number().int().describe('浏览器原生 tabId（ab_open_tabs 里的 tabId）'),
       title: z.string().optional(),
       url: z.string().optional(),
+      browserId: z.string().optional().describe('目标浏览器 id（ab_list_browsers 的 id；缺省=默认浏览器）'),
     },
-  }, guard(async ({ providerTabId, title, url }) => {
-    const browser = api.browsers.getDefault();
+  }, guard(async ({ providerTabId, title, url, browserId }) => {
+    const browser = pickBrowser(browserId);
     const tab = await browser.user.claimTab({
       providerTabId,
       ...(title !== undefined ? { title } : {}),

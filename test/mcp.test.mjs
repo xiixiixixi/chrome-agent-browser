@@ -246,3 +246,39 @@ test('无浏览器连接时工具返回结构化错误（isError + error 文本�
     await manager.stop();
   }
 });
+
+
+// ---- 多浏览器路由（Chrome + Arc 同在线）----
+test('多浏览器：两台在线；browserId 指定 Arc 不串台；缺省走默认（第一台）；未知 id 报清晰错误', async () => {
+  const s = await startMcpStack();
+  try {
+    // 第二台浏览器（模拟 Arc）
+    const arcMock = await startMockExtension({ port: s.manager.port, instanceId: 'mock-arc-1' });
+    await once(s.manager, 'browser');
+
+    const list = s.api.browsers.list();
+    assert.equal(list.length, 2, `应有两台在线: ${JSON.stringify(list)}`);
+    const arcId = list.find((b) => b.id === 'mock-arc-1')?.id;
+    assert.ok(arcId, 'Arc 实例应在线');
+
+    // 指定 Arc：tab_create 应发到 arcMock
+    await s.callJson('ab_new_tab', { url: 'https://arc.example/', browserId: arcId });
+    assert.ok(arcMock.calls.some((c) => c.method === 'tab_create' && c.params.url === 'https://arc.example/'),
+      'tab_create 应到达 Arc 连接');
+    assert.ok(!s.mock.calls.some((c) => c.method === 'tab_create' && c.params.url === 'https://arc.example/'),
+      '不应串到第一台');
+
+    // 缺省：走默认浏览器（第一台）
+    await s.callJson('ab_new_tab', { url: 'https://default.example/' });
+    assert.ok(s.mock.calls.some((c) => c.method === 'tab_create' && c.params.url === 'https://default.example/'),
+      '缺省应到第一台');
+
+    // 未知 browserId：清晰报错
+    const r3 = await s.call('ab_new_tab', { browserId: 'no-such' });
+    assert.ok(JSON.stringify(r3).includes('browser not found'), JSON.stringify(r3).slice(0, 200));
+
+    arcMock.close();
+  } finally {
+    await s.close();
+  }
+});
