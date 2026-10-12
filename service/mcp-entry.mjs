@@ -38,6 +38,18 @@ const FRONTEND_DRAIN_GRACE_MS = 60_000; // stdin EOF 后等 frontend 排水的�
 /** 日志一律 stderr（stdout 是 MCP 线缆）。 */
 const log = (...a) => process.stderr.write(`${a.join(' ')}\n`);
 
+/** 尝试接管端口成为 service（后端死亡恢复用）。成功返回新 ConnectionManager；端口被占返回 null。 */
+export async function attemptServiceTakeover(port) {
+  try {
+    const m = new ConnectionManager({ port });
+    await m.start();
+    return m;
+  } catch (err) {
+    if (err && err.code === 'EADDRINUSE') return null;
+    throw err;
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   if (args.help) { log(USAGE); return 0; }
@@ -85,14 +97,59 @@ export async function main(argv = process.argv.slice(2)) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  const attachManagerLogs = (m) => {
+    m.on('browser', (c) => log(`[browser] connected ${c.instanceId} (${c.family} ${c.browserVersion ?? ''})${c.restored ? ' [restored]' : ''}`));
+    m.on('browserClosed', (c) => log(`[browser] closed ${c.instanceId}; lease mirror retained for reconnect window`));
+    m.on('frontendCountChange', (n) => log(`[cab-mcp] frontend connections: ${n}`));
+  };
+
   if (manager) {
     log(`[cab-mcp] MCP stdio ready; service ws://127.0.0.1:${manager.port} (policy: ${args.policy ?? 'defaults'})`);
-    manager.on('browser', (c) => log(`[browser] connected ${c.instanceId} (${c.family} ${c.browserVersion ?? ''})${c.restored ? ' [restored]' : ''}`));
-    manager.on('browserClosed', (c) => log(`[browser] closed ${c.instanceId}; lease mirror retained for reconnect window`));
-    manager.on('frontendCountChange', (n) => log(`[cab-mcp] frontend connections: ${n}`));
+    attachManagerLogs(manager);
   } else {
     log(`[cab-mcp] frontend mode: sharing service on port ${args.port} (policy: ${args.policy ?? 'defaults'})`);
-    remoteFrontend.on('browserClosed', () => log('[cab-mcp] service connection lost (browserClosed); commands will fail until this process restarts'));
+
+    // ---- 后端死亡恢复（实战教训：服务中途死掉时 MCP 客户端不会重拉活着的子进程）----
+    // 前端进程发现后端断开 → 先尝试接管端口变成新服务（浏览器扩展会自动重连）；
+    // 接管失败（别人占着）→ 重新以前端模式接入；连续失败才退出让客户端重拉。
+    let recoveryFailures = 0;
+    let recovering = false;
+    const scheduleRecovery = async (reason) => {
+      if (stopping || recovering) return;
+      recovering = true;
+      try {
+        log(`[cab-mcp] 后端服务连接断开（${reason}），尝试恢复…`);
+        await new Promise((r) => setTimeout(r, 800)); // 等端口释放/新服务稳定
+        if (stopping) return;
+        const m = await attemptServiceTakeover(args.port);
+        if (m) {
+          try { remoteFrontend?.stop(); } catch { /* 已断 */ }
+          remoteFrontend = null;
+          manager = m;
+          attachManagerLogs(m);
+          log(`[cab-mcp] ✓ 已接管为 service 模式（端口 ${args.port}）；浏览器扩展将自动重连`);
+          return;
+        }
+        const rf = new RemoteFrontend({ port: args.port });
+        await rf.start(); // 3s 内握手不上会抛
+        try { remoteFrontend?.stop(); } catch { /* 已断 */ }
+        remoteFrontend = rf;
+        rf.on('browserClosed', () => scheduleRecovery('service connection lost'));
+        recoveryFailures = 0;
+        log('[cab-mcp] ✓ 新服务已出现，重新以 frontend 模式接入');
+      } catch {
+        recoveryFailures += 1;
+        if (recoveryFailures >= 5) {
+          log('[cab-mcp] 恢复连续失败 5 次，退出本进程（MCP 客户端下次会话会重新拉起）');
+          process.exit(1);
+        }
+        setTimeout(() => { recovering = false; scheduleRecovery('retry'); }, Math.min(1000 * 2 ** recoveryFailures, 15000));
+        return;
+      } finally {
+        recovering = false;
+      }
+    };
+    remoteFrontend.on('browserClosed', () => scheduleRecovery('service connection lost'));
   }
 
   let stopping = false;

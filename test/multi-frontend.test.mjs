@@ -438,3 +438,46 @@ test('场景5c：service 进程被杀 → 前端进程报错清晰、正常退�
     if (p2.exitCode === null && p2.signalCode === null) p2.kill('SIGKILL');
   }
 });
+
+
+// ---- 后端死亡 → 前端接管（实战教训的回归测试）----
+test('takeover：端口空闲时可接管；端口被占时返回 null', async () => {
+  const { attemptServiceTakeover } = await import('../service/mcp-entry.mjs');
+  const m1 = new ConnectionManager({ port: 0 });
+  await m1.start();
+  // 被占 → null
+  assert.equal(await attemptServiceTakeover(m1.port), null);
+  // 释放 → 接管成功，拿到能用的 manager
+  const port = m1.port;
+  await m1.stop();
+  const m2 = await attemptServiceTakeover(port);
+  assert.ok(m2, '端口释放后应接管成功');
+  await m2.stop();
+});
+
+test('takeover 全路径：前端挂的服务死了 → 前端侧接管端口 → 浏览器可重连', async () => {
+  const { attemptServiceTakeover } = await import('../service/mcp-entry.mjs');
+  // service + 伪浏览器 + 前端
+  const m1 = new ConnectionManager({ port: 0 });
+  await m1.start();
+  const mock = await startMockExtension({ port: m1.port });
+  await once(m1, 'browser');
+  const rf = new RemoteFrontend({ port: m1.port });
+  await rf.start();
+  assert.equal(rf.liveConnections().length, 1, '前端应能看到浏览器');
+
+  // 模拟服务死亡
+  const port = m1.port;
+  mock.close();
+  await m1.stop();
+
+  // 前端恢复逻辑的核心一步：接管
+  const m2 = await attemptServiceTakeover(port);
+  assert.ok(m2, '应接管成功');
+  // 浏览器宿主会自动重拨（真实场景），这里直接重连伪扩展验证新 service 可用
+  const mock2 = await startMockExtension({ port, instanceId: 'mock-after-takeover' });
+  await once(m2, 'browser');
+  assert.equal(m2.liveConnections().length, 1);
+  mock2.close();
+  await m2.stop();
+});
