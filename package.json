@@ -37,5 +37,23 @@
     "setup.mjs",
     "uninstall.mjs",
     "doctor.mjs"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiixiixixi/chrome-agent-browser.git"
+  },
+  "homepage": "https://github.com/xiixiixixi/chrome-agent-browser#readme",
+  "bugs": {
+    "url": "https://github.com/xiixiixixi/chrome-agent-browser/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "browser-automation",
+    "chrome",
+    "chromium",
+    "arc",
+    "extension",
+    "agent"
   ]
 }
