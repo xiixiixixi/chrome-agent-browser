@@ -216,6 +216,23 @@ try {
         `webmcpHint.toolNames 应含 ab_echo: ${JSON.stringify(ctx.webmcpHint)}`);
       assert.equal(ctx.webmcpHint.count, ctx.webmcpHint.toolNames.length);
     });
+    // v0.2.2：attach 即启用——新标签页从未调过 webmcp.list，仅一次普通交互（eval 触发 attach）
+    // 后，tab_info 也应出现 webmcpHint（证明"第一推动"不再依赖手动 list）
+    await step('WebMCP 第一推动：全新标签页不 list 也有 webmcpHint（v0.2.2；不支持则 SKIP）', async () => {
+      if (webmcpSkip) { console.log(`        SKIP：${webmcpSkip}`); return; }
+      const fresh = await browser.tabs.new();
+      try {
+        await fresh.goto(pageUrl);
+        await fresh.eval('1+1'); // 普通交互触发 attach → WebMCP.enable → toolsAdded → 通知
+        let ctx = null;
+        for (let i = 0; i < 15 && !(ctx && ctx.webmcpHint && ctx.webmcpHint.toolNames.includes('ab_echo')); i++) {
+          ctx = await browser.user.getTabContext({ tabId: fresh.id });
+          if (!ctx.webmcpHint) await new Promise((r) => setTimeout(r, 200));
+        }
+        assert.ok(ctx && ctx.webmcpHint && ctx.webmcpHint.toolNames.includes('ab_echo'),
+          `全新未 list 标签页应有第一推动 hint: ${JSON.stringify(ctx)}`);
+      } finally { await fresh.close(); }
+    });
     await step('tab.close() 后标签页消失', async () => {
       await tab.close();
       const tabs = await browser.user.openTabs();

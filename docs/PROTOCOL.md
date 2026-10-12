@@ -43,6 +43,7 @@ service (service/service.mjs) ——命令层 + 租约镜像 + MCP 服务器
 ## 5. CDP 直通
 
 - `tab_cdp_call` 白名单在 shared/protocol.mjs `CDP_ALLOWLIST`（默认拒绝）；含实验域 `WebMCP.*`。
+- attach 即启用 WebMCP（v0.2.2）：ensureAttached 附带 WebMCP.enable（尽力而为，旧浏览器静默跳过），页面工具从附身起即有第一推动，无需先手动 list。
 - 原始事件环：扩展按 tabId 缓冲（环形，每 tab 最多 500 条，带自增 sequence）；`tab_cdp_events` 游标分页，`truncated:true` 表示旧事件被逐出。
 - attach 生命周期：命令需要时自动 attach（chrome.debugger.attach(tabId,"1.3")）；租约释放/tab 关闭时 detach；收到 onDetach 事件同步状态。
 

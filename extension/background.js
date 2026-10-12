@@ -57,6 +57,7 @@ const EV = {
   DOWNLOAD: 'onDownloadChange',
   DIALOG: 'onJsDialog',
   BADGES: 'onBadgeChange',
+  WEBMCP_TOOLS: 'onWebmcpTools', // v0.2.1 推送式发现（曾因硬拷贝漏加此行导致静默丢事件——见 test/sync.test.mjs）
 };
 
 // CDP 白名单（硬拷贝 shared/protocol.mjs CDP_ALLOWLIST；tab_cdp_call 默认拒绝）
@@ -350,6 +351,9 @@ async function ensureAttached(tabId) {
     await cdpSend(tabId, 'Runtime.enable', {});
     await cdpSend(tabId, 'DOM.enable', {});
     if (st.viewport) await applyViewport(tabId); // 新 attach 应用当前视口
+    // 附身即启用 WebMCP（v0.2.2）：不等首次 list——toolsAdded 从 attach 起就有第一推动。
+    // 尽力而为：旧 Chrome 无此域时静默忽略（list 命令仍会给出明确 -32011 提示）。
+    try { await cdpSend(tabId, 'WebMCP.enable', {}); } catch (e) { /* 不支持则跳过 */ }
   } catch (e) {
     if (attachedNow) { try { await chrome.debugger.detach({ tabId }); } catch (e2) { /* 忽略 */ } }
     st.attached.delete(tabId);
