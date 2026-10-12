@@ -19,7 +19,7 @@ const REAL_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PzWvWQAAAABJRU5ErkJggg==';
 
 const ALL_TOOLS = [
-  'ab_list_browsers', 'ab_status', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
+  'ab_list_browsers', 'ab_status', 'ab_visibility', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
   'ab_screenshot', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open',
   'ab_confirm', 'browser_eval',
 ];
@@ -308,4 +308,15 @@ test('无浏览器时 ab_new_tab 报带排查指引的错误', async () => {
   assert.ok(JSON.stringify(res).includes('no browser connected'));
   assert.ok(JSON.stringify(res).includes('doctor'), '错误里应指向 doctor 排查');
   await client.close(); await server.close(); await manager.stop();
+});
+
+test('ab_visibility：get/set 走到浏览器连接', async () => {
+  const s = await startMcpStack({ handlers: { browser_visibility_get: () => ({ visible: false }), browser_visibility_set: () => ({}) } });
+  try {
+    const r1 = await s.callJson('ab_visibility', { action: 'get' });
+    assert.equal(r1.visible, false);
+    const r2 = await s.callJson('ab_visibility', { action: 'set', visible: true });
+    assert.equal(r2.ok, true);
+    assert.ok(s.mock.calls.some((c) => c.method === 'browser_visibility_set' && c.params.visible === true), '命令应到达扩展');
+  } finally { await s.close(); }
 });

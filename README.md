@@ -67,6 +67,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | `ab_open_tabs` | 列出用户已开的标签页（可选 `browserId` 指定目标，如 Arc） |
 | `ab_new_tab` / `ab_tab_info` / `ab_navigate` | 开标签页 / 读信息 / 导航（过策略门） |
 | `ab_screenshot` / `ab_ax_state` | 截图（PNG）/ 无障碍树文本 |
+| `ab_visibility` | 显示/隐藏浏览器窗口（想"围观"AI 操作时 set(true)） |
 | `ab_claim_tab` | 认领一个已开的用户标签页（标题/网址三重匹配，防认错） |
 | `ab_cdp` / `ab_download_open` | 原样 CDP（白名单+确认门）/ 打开下载文件（确认门） |
 | `ab_confirm` | 批准一次待确认动作（5 分钟一次性令牌） |

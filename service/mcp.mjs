@@ -140,6 +140,26 @@ export function buildMcpServer({ api, policy = null, connections = null, service
     return textResult({ mode, port, uptimeSec, browsers, hint });
   }));
 
+  // ---- 0b. ab_visibility（围观开关：把浏览器窗口带到面前/收起）----
+  const connFor = () => {
+    const cs = typeof connections === 'function' ? connections() : [];
+    if (!cs.length) { const e = new Error('no browser connected（先确认浏览器在线，ab_status 体检）'); e.code = -32000; throw e; }
+    return cs[0];
+  };
+  server.registerTool('ab_visibility', {
+    title: '显示/隐藏浏览器窗口',
+    description: '控制浏览器窗口可见性。默认后台操作不抢焦点；用户想"围观"操作时调 set(true) 把窗口带到面前，结束再 set(false) 收起。action: get | set。',
+    inputSchema: {
+      action: z.enum(['get', 'set']).describe('get=查询当前可见性；set=设置'),
+      visible: z.boolean().optional().describe('action=set 时必填：true 显示并聚焦 / false 最小化'),
+    },
+  }, guard(async ({ action, visible }) => {
+    if (action === 'get') return textResult(await connFor().cmd('browser_visibility_get', {}));
+    if (visible === undefined) throw new Error('action=set 需要 visible: true|false');
+    await connFor().cmd('browser_visibility_set', { visible });
+    return textResult({ ok: true, visible });
+  }));
+
   // ---- 1. ab_list_browsers ----
   server.registerTool('ab_list_browsers', {
     title: '列出浏览器',
