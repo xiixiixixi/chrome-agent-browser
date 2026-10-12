@@ -25,17 +25,36 @@
 - 命令目录、事件、错误码、CDP 白名单的单一事实来源：`shared/protocol.mjs`。
 - 连接方向：host 主动连 service（service 监听 127.0.0.1）；一个浏览器一个 host 进程；断连后租约镜像保留 60s 等重连。
 
-## 快速开始（两条命令 + 一次拖拽）
+## 快速开始（npm 安装，两条命令 + 一次拖拽）
 
 ```bash
-# 1. 克隆并装依赖（需要 Node 18+）
-git clone https://github.com/xiixiixixi/chrome-agent-browser.git
-cd chrome-agent-browser && npm install
+# 1. 全局安装（需要 Node 18+；全局路径固定 → 扩展 ID 稳定，升级不失效）
+npm install -g chrome-agent-browser
 
 # 2. 一条命令安装：自动算扩展ID → 检测已装浏览器 → 写清单/配置 → 打开 Chrome 扩展页
 #    （扩展目录路径自动进剪贴板）→ 原地等待验证，你在 Chrome 里加载完扩展那一刻自动打钩
+chrome-agent-browser          # 即 setup
+```
+
+MCP 配置（无需路径，命令已进 PATH）：
+
+```json
+{ "mcpServers": { "chrome-agent-browser": { "command": "chrome-agent-browser-mcp" } } }
+```
+
+其他命令：`chrome-agent-browser-doctor`（体检）、`chrome-agent-browser-uninstall`（卸载）、
+`chrome-agent-browser -- --no-open/--port/--browser arc` 等参数照旧。
+
+<details><summary>从 GitHub 源码安装（替代方式）</summary>
+
+```bash
+git clone https://github.com/xiixiixixi/chrome-agent-browser.git
+cd chrome-agent-browser && npm install
 npm run setup
 ```
+MCP 配置指向 `node /绝对路径/chrome-agent-browser/service/mcp-entry.mjs`。
+
+</details>
 
 setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开发者模式 →
 「加载已解压的扩展程序」→ 粘贴剪贴板里的目录路径。验证打钩后，setup 直接给出

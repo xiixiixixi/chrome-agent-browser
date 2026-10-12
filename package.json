@@ -1,16 +1,16 @@
 {
   "name": "chrome-agent-browser",
   "version": "0.1.0",
-  "private": true,
-  "description": "Let MCP agents drive your real Chromium-family browser (with your logged-in sessions) via a browser extension + native host + local service.",
+  "description": "Let MCP agents drive your real Chromium-family browser (with your logged-in sessions): extension + native host + local service, one-command setup",
   "type": "module",
   "engines": {
     "node": ">=18"
   },
   "bin": {
-    "chrome-agent-browser-host": "./host/host.mjs",
-    "cab-service": "./service/service.mjs",
-    "chrome-agent-browser-install": "./installer/install.mjs"
+    "chrome-agent-browser": "./setup.mjs",
+    "chrome-agent-browser-mcp": "./service/mcp-entry.mjs",
+    "chrome-agent-browser-doctor": "./doctor.mjs",
+    "chrome-agent-browser-uninstall": "./uninstall.mjs"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
@@ -26,5 +26,16 @@
     "ws": "^8.18.0",
     "zod": "^3.23.8",
     "@modelcontextprotocol/sdk": "^1.0.0"
-  }
+  },
+  "files": [
+    "extension/",
+    "host/host.mjs",
+    "installer/",
+    "service/",
+    "shared/",
+    "docs/PROTOCOL.md",
+    "setup.mjs",
+    "uninstall.mjs",
+    "doctor.mjs"
+  ]
 }

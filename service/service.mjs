@@ -107,7 +107,7 @@ export async function main(argv = process.argv.slice(2)) {
   //（浏览器扩展的宿主按这份配置拨号；两边端口不一致 = 永远连不上）
   if (!process.argv.includes('--port')) {
     try {
-      const cfg = JSON.parse(readFileSync(resolve(import.meta.dirname, 'host-config.json'), 'utf8'));
+      const cfg = JSON.parse(readFileSync(resolve(path.dirname(fileURLToPath(import.meta.url)), 'host-config.json'), 'utf8'));
       if (Number.isInteger(cfg.servicePort) && cfg.servicePort > 0 && cfg.servicePort < 65536) args.port = cfg.servicePort;
     } catch { /* 无配置文件则用默认端口 */ }
   }
