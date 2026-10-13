@@ -1,6 +1,6 @@
 {
   "name": "chrome-agent-browser",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Let MCP agents drive your real Chromium-family browser (with your logged-in sessions): extension + native host + local service, one-command setup",
   "type": "module",
   "engines": {

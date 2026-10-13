@@ -319,12 +319,16 @@ test('installer: 沙箱安装 chrome 家族 → 清单/shim/host-config 全部�
   assert.equal(manifest.description, 'Chrome Agent Browser native host');
   assert.deepEqual(manifest.allowed_origins, [`chrome-extension://${ID_A}/`]);
 
+  // shim（v0.2.3）：必须写绝对路径 node——GUI 启动的浏览器没有 shell PATH，裸 node 会 exit 127
+  const shimContent = readFileSync(manifest.path, 'utf8');
+  assert.ok(shimContent.includes(process.execPath), `shim 应含 node 绝对路径 ${process.execPath}: ${shimContent}`);
+  assert.ok(!/^exec node /m.test(shimContent), 'shim 不得使用裸 node 命令');
   // shim：清单 path 指向它，且带可执行位
   const shimPath = manifest.path;
   assert.equal(shimPath, path.join(REPO_ROOT, 'host', 'chrome-agent-browser-host'));
   assert.ok(existsSync(shimPath));
   assert.notEqual(statSync(shimPath).mode & 0o111, 0, 'shim must be executable');
-  assert.match(readFileSync(shimPath, 'utf8'), /^#!\/bin\/sh\nexec node "/);
+  assert.match(shimContent, /^#!\/bin\/sh\nexec \"/); // v0.2.3：exec 后是带引号的绝对路径
   assert.ok(readFileSync(shimPath, 'utf8').includes(path.join(REPO_ROOT, 'host', 'host.mjs')));
 
   // host-config：写进仓库 host/

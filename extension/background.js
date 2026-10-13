@@ -159,7 +159,9 @@ function onPortClosed(port) {
 
 function scheduleReconnect() {
   st.reconnectAttempt += 1;
-  const delay = BACKOFF_MS[Math.min(st.reconnectAttempt - 2, BACKOFF_MS.length - 1)];
+  // 下标钳制到 0：首次同步失败时 attempt-2 = -1 会取到 undefined（when=NaN 闹钟建不起来，
+  // 重连链死亡）——2026-10-13 真 Chrome 实测复现修复
+  const delay = BACKOFF_MS[Math.max(0, Math.min(st.reconnectAttempt - 2, BACKOFF_MS.length - 1))];
   setConnState('reconnecting');
   chrome.alarms.create(ALARM_RECONNECT, { when: Date.now() + delay });
   log('reconnect in', delay, 'ms (attempt', st.reconnectAttempt, ')');

@@ -276,11 +276,14 @@ export function windowsRegistryAddArgs(family, manifestPath) {
 // ---------------------------------------------------------------------------
 
 /** POSIX shim：#!/bin/sh + exec node（清单 path 必须是可执行文件，不能带参数）。 */
-export function buildShimContent(hostScriptPath, platform = process.platform) {
+export function buildShimContent(hostScriptPath, platform = process.platform, nodePath = process.execPath) {
+  // 实战教训（2026-10-13 真 Chrome 测试）：GUI 启动的浏览器不继承 shell 的 PATH，
+  // 裸写 `node` 会导致宿主脚本 exit 127 秒死。必须写安装时 node 的绝对路径。
+  const bin = JSON.stringify(nodePath || process.execPath);
   if (platform === 'win32') {
-    return `@echo off\r\nnode "${hostScriptPath}" %*\r\n`;
+    return `@echo off\r\n"${nodePath}" "${hostScriptPath}" %*\r\n`;
   }
-  return `#!/bin/sh\nexec node "${hostScriptPath}" "$@"\n`;
+  return `#!/bin/sh\nexec ${bin} "${hostScriptPath}" "$@"\n`;
 }
 
 export function buildManifest({ extensionIds, hostPath }) {
