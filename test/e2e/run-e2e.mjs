@@ -131,10 +131,16 @@ chrome.stderr.on('data', (d) => { const s = String(d); if (/agentbrowser|ab\]/i.
 
 let browserInfo = null;
 try {
-  // ---- 5. 等扩展注册（最多 30s） ----
+  // ---- 5. 等扩展注册（最多 30s）----
+  // 隔离防串扰：本机真实 Chrome 也加载着同仓库扩展，其存活的后台脚本（可能是旧版本代码）
+  // 会在安装器改写 host-config 端口期间抢先注册。只认"启动我们的 Chromium 之后才新出现"
+  // 的浏览器，启动前已在线的一律忽略。
+  const knownBefore = new Set(manager.liveConnections().map((c) => c.instanceId));
   await step('扩展经原生宿主连入服务（ext/hello 注册）', async () => {
-    const got = new Promise((res) => manager.once('browser', res));
-    browserInfo = await Promise.race([got, new Promise((_, rej) => setTimeout(() => rej(new Error('30s 内无浏览器注册')), 30000))]);
+    const got = new Promise((res) => manager.on('browser', function onNew(c) {
+      if (!knownBefore.has(c.instanceId)) { manager.off('browser', onNew); res(c); }
+    }));
+    browserInfo = await Promise.race([got, new Promise((_, rej) => setTimeout(() => rej(new Error('30s 内无新浏览器注册')), 30000))]);
   });
 
   if (browserInfo) {
@@ -145,7 +151,7 @@ try {
       assert.equal(list[0].family, 'chrome');
     });
 
-    const browser = api.browsers.getDefault();
+    const browser = api.browsers.get(browserInfo.instanceId);
     let tab = null;
     await step('tabs.new() 创建 agent 标签页', async () => {
       tab = await browser.tabs.new();
@@ -212,6 +218,22 @@ try {
       const elt = await tab.playwright.getByTestId('submit-btn').screenshot();
       assert.ok(Buffer.isBuffer(elt) && elt.length > 8 && elt[0] === 0x89 && elt[1] === 0x50, `element len=${elt && elt.length}`);
       assert.ok(elt.length < full.length, `元素截图（${elt.length}B）应小于全页（${full.length}B）`);
+    });
+    // v0.4.0 实时投屏：真 Page.startScreencast 帧流（扩展 ack + 250ms 节流 → onScreencastFrame
+    // → 服务环形缓存）。页面有 200ms 动画 → 两次取帧（间隔 500ms）应都是合法 JPEG 且 ts 递增。
+    await step('实时投屏：取 2 帧（间隔 500ms）均为合法 JPEG 且第二帧更新；结束 stop', async () => {
+      const sc = tab.capabilities.get('screencast');
+      const f1 = (await sc.frames({}))[0];
+      assert.ok(f1, 'lazy start 后首帧应在 3s 内到达');
+      const b1 = Buffer.from(f1.data, 'base64');
+      assert.ok(b1.length > 100 && b1[0] === 0xff && b1[1] === 0xd8 && b1[2] === 0xff, `帧1 非合法 JPEG: len=${b1.length}`);
+      await new Promise((r) => setTimeout(r, 500));
+      const f2 = (await sc.frames({}))[0];
+      const b2 = Buffer.from(f2.data, 'base64');
+      assert.ok(b2.length > 100 && b2[0] === 0xff && b2[1] === 0xd8 && b2[2] === 0xff, `帧2 非合法 JPEG: len=${b2.length}`);
+      assert.ok(f2.ts > f1.ts, `第二帧 ts 应更新: ${f2.ts} > ${f1.ts}`);
+      console.log(`        帧字节数: ${b1.length} → ${b2.length}（动画页面，帧间可不同）`);
+      await sc.stop();
     });
     await step('批量隐形阅读：两个 URL 读回正文含关键词，临时标签读完即关', async () => {
       const pages = await browser.tabs.content({ urls: [pageUrl, page2Url] });

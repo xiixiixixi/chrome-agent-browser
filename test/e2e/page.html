@@ -8,6 +8,7 @@
   <button id="btn" data-testid="submit-btn" role="button" aria-label="提交">点我</button>
   <a id="link" href="#done" aria-label="链接甲">链接甲</a>
   <div id="out" role="status" aria-live="polite"></div>
+  <div id="anim" style="height: 24px; width: 20px; background: #e11;"></div>
   <script>
     // 页面被真实点击/填写后改变状态，供 E2E 断言“操作真的发生了”
     document.getElementById('btn').addEventListener('click', () => {
@@ -15,6 +16,12 @@
       document.getElementById('out').textContent = 'clicked:' + v;
     });
     window.__e2eMarker = 'loaded';
+    // 持续动画（每 200ms 变宽后循环）：让实时投屏（ab_screencast）总有新帧可拍
+    setInterval(() => {
+      const el = document.getElementById('anim');
+      const w = parseInt(el.style.width, 10) + 20;
+      el.style.width = (w > 600 ? 20 : w) + 'px';
+    }, 200);
   </script>
   <script>
     // WebMCP 工具声明（按 2026 WebMCP 页面 JS API：document.modelContext.registerTool）。

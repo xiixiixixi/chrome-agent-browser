@@ -79,6 +79,31 @@ service (service/service.mjs) ——命令层 + 租约镜像 + MCP 服务器
 
 service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型）：origin 精确匹配（容忍 www.）→ 钥匙串取凭据（内存即用即弃）→ `login_detect` → locator fill（用户名/密码/TOTP）→ locator click 提交 → 3 秒内 tab 跳完全不同的域则结果标 `suspicious:true` 并写审计 `login_suspicious`。
 
+## 5d. 实时投屏（`screencast_start`/`screencast_stop`，v0.4.0）
+
+把网页变成帧流（`Page.startScreencast`），视觉 AI 从"看照片"（截图）升级到"看直播"（连续取帧）：
+
+- `screencast_start {tabId, everyNthFrame?, quality?, maxWidth?, maxHeight?}` → `{ok:true}`
+  扩展侧：ensureAttached → `Page.startScreencast {format:'jpeg', quality:60(默认), maxWidth:1280, maxHeight:800, everyNthFrame:1(默认)}`，登记该 tab 为投屏中（重复 start 视为重启）。
+- `screencast_stop {tabId}` → `{ok:true}`
+  `Page.stopScreencast` + 除名（幂等）。
+- 帧上行：通知 `onScreencastFrame {tabId, data, ts, metadata}`。扩展收到 `Page.screencastFrame`
+  事件后**立即回 `Page.screencastFrameAck {sessionId}`**（不回浏览器会停止发帧），再按
+  **250ms/tab 节流**转发（窗口内的中间帧丢弃、保留最新一帧到期补发）。`data` 为 jpeg base64；
+  `metadata` 只留 offsetTop/pageScaleFactor/deviceWidth/deviceHeight 摘要。
+  **帧不进通用 CDP 事件环 / onCDPEvent**（体积大，避免冲爆环形缓冲）。
+- 生命周期（扩展侧自动 stop / 除名）：tab 关闭（tabs.onRemoved）、debugger onDetach、
+  `session_finalize`（本会话所有投屏中的标签页，含保留页）。
+- service 侧：`connection` 把通知分发为 `screencast` 事件；`api` 层每 tab **环形缓存最近
+  20 帧**（收到即存；帧数据不进审计、不落盘）；`tab.capabilities.get('screencast')` →
+  `{start(opts), stop(), frames({limit?, sinceTs?})}`。`frames` 无缓存且未投屏时自动
+  **lazy start** 并等首帧（至多 3s）——默认零开销；`stop` 清缓存并除名。
+- MCP 面：`ab_screencast {action:'frames'|'stop', tabId, limit?(默认 1、上限 5)}`——
+  frames 返回 MCP image content（jpeg）+ 每帧时间戳文本行；**不提供 start 动作**，
+  开始投屏由首次取帧自动完成，stop 由模型显式调（或 tab 关闭兜底）。
+- CDP 白名单新增 `Page.startScreencast` / `Page.stopScreencast` / `Page.screencastFrameAck`
+  （经 `tab_cdp_call` 手动使用时帧仍走专用通道节流转发，不泛洪 onCDPEvent）。
+
 ## 6. 安全门（service 层强制）
 
 - 高危动作（转账/发送/删除/下载执行/CDP 危险面）由 service 的 policy 模块拦截 → `POLICY_BLOCKED`，data 里带需要的人类确认句柄。

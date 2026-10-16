@@ -220,7 +220,7 @@ test('webmcp capability：list 透传 / 只读直通 / 非只读过确认门（a
   const mock = await connectMock(manager);
   try {
     const tab = await api.browsers.getDefault().tabs.new({});
-    assert.deepEqual(tab.capabilities.list(), ['cdp', 'webmcp']);
+    assert.deepEqual(tab.capabilities.list(), ['cdp', 'webmcp', 'screencast']);
     assert.equal(tab.capabilities.get('nope'), null);
     const webmcp = tab.capabilities.get('webmcp');
 

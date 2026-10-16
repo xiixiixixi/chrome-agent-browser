@@ -4,8 +4,9 @@
 // 便于测试注入 InMemoryTransport；入口见 service/mcp-entry.mjs）。
 //
 // 两层工具面（对照规格书 §13 路线图第 3 条「粗粒度工具 + REPL 双层」）：
-//   - ab_* 粗粒度工具：开标签/导航/截图（整页/元素）/无障碍树/认领/CDP/下载确认/
-//     批量读页/视口/凭据仓（ab_login 凭据只在本机流转，不进模型），全部过策略门；
+//   - ab_* 粗粒度工具：开标签/导航/截图（整页/元素）/实时投屏帧（ab_screencast）/
+//     无障碍树/认领/CDP/下载确认/批量读页/视口/凭据仓（ab_login 凭据只在本机流转，
+//     不进模型），全部过策略门；
 //   - browser_eval：REPL 型工具，node:vm 沙箱内执行 JS，注入 `agent`（createAgentApi
 //     的返回对象，即可写 `const t = await (await agent.browsers.getDefault()).tabs.new()`）
 //     与 `nodeRepl.write(x)`（收集输出）；不注入 require；console.* 一并收集。
@@ -69,7 +70,7 @@ function fmtValue(v) {
 }
 
 /**
- * 构建 MCP 服务器（20 个工具）。
+ * 构建 MCP 服务器（21 个工具）。
  * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null, audit?: object|null, credentials?: object|null}} opts
  *   api         —— createAgentApi 的返回值（必填）
  *   policy      —— service/policy.mjs 的 Policy 实例（缺省时跳过工具层策略，api 层仍可能拦）
@@ -85,7 +86,7 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
   //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
   const server = new McpServer(
-    { name: 'chrome-agent-browser', version: '0.3.2' },
+    { name: 'chrome-agent-browser', version: '0.4.0' },
     { capabilities: { logging: {} } },
   );
   const loginFlow = createLogin({ credentials, audit }); // ab_login 流程（credentials 为 null 时由工具层先拦）
@@ -328,6 +329,35 @@ export function buildMcpServer({ api, policy = null, connections = null, service
         { type: 'image', data, mimeType: fmt === 'jpeg' ? 'image/jpeg' : 'image/png' },
       ],
     };
+  }));
+
+  // ---- 6b. ab_screencast（实时投屏取帧：网页变帧流，"看照片"升级"看直播"） ----
+  server.registerTool('ab_screencast', {
+    title: '实时投屏取帧',
+    description: '把标签页当作实时画面：action=frames 取最新帧（MCP image content，JPEG）。首次调用自动开始投屏（lazy start，默认零开销），最多等首帧 3s。页面在加载/动画/滚动/变化时连续多次取帧即可"看直播"——每帧都是取帧瞬间的最新画面，不是同一张静态截图；limit 可取最近多帧对比变化（默认 1、上限 5）。看完不再需要时调 action=stop 停止投屏省资源（tab 关闭时自动停）。没有 start 动作——开始投屏这件事由首次取帧自动完成。',
+    inputSchema: {
+      action: z.enum(['frames', 'stop']).describe('frames=取最新帧（首次自动开始投屏）；stop=停止投屏省资源'),
+      tabId: z.number().int().describe('标签页 id（ab_new_tab/ab_claim_tab 返回）'),
+      limit: z.number().int().positive().max(5).optional().describe('action=frames 返回的帧数，默认 1（最新一帧）、最多 5（按时间正序，最新在末尾）'),
+    },
+  }, guard(async ({ action, tabId, limit }) => {
+    const { tab } = await resolveTab(tabId);
+    const sc = tab.capabilities.get('screencast');
+    if (!sc) return textResult({ blocked: true, reason: 'browser has no screencast capability' });
+    if (action === 'stop') {
+      await sc.stop();
+      return textResult({ ok: true, stopped: true, tabId });
+    }
+    const frames = await sc.frames(limit !== undefined ? { limit } : {});
+    if (!frames.length) {
+      return textResult({ tabId, frames: 0, note: '暂未收到帧（等首帧 3s 超时，或页面暂无渲染活动）；稍后重试 frames，或 action=stop 结束' });
+    }
+    const content = [{
+      type: 'text',
+      text: `screencast: tabId=${tabId} frames=${frames.length} ts=${frames.map((f) => f.ts).join(',')}`,
+    }];
+    for (const f of frames) content.push({ type: 'image', data: f.data, mimeType: 'image/jpeg' });
+    return { content };
   }));
 
   // ---- 7. ab_ax_state ----

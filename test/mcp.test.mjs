@@ -28,7 +28,7 @@ const ELEMENT_PNG_B64 =
 
 const ALL_TOOLS = [
   'ab_list_browsers', 'ab_status', 'ab_visibility', 'ab_viewport', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
-  'ab_screenshot', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open', 'ab_read_urls',
+  'ab_screenshot', 'ab_screencast', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open', 'ab_read_urls',
   'ab_confirm', 'ab_webmcp', 'ab_audit', 'ab_login', 'ab_credentials', 'browser_eval',
 ];
 

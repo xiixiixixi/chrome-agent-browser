@@ -6,7 +6,7 @@
 //   - 握手：对端先发 host/hello 请求（回 {ok:true}），随后发 ext/hello 通知
 //     完成浏览器注册（instanceId 区分多浏览器）。
 //   - 出站命令 cmd()：JSON-RPC 请求，id 自增 + 挂起表 + 超时（默认 15s）。
-//   - 入站通知按 EV.* 分发为 'page'/'cdp'/'lease'/'download'/'dialog'/'badge'/'webmcp'。
+//   - 入站通知按 EV.* 分发为 'page'/'cdp'/'lease'/'download'/'dialog'/'badge'/'webmcp'/'screencast'。
 //   - 心跳：每 heartbeatIntervalMs 发 browser_status，连续失败 maxFailures 次判死。
 //   - 断连保留租约镜像 leaseMirrorTtlMs（默认 60s），同 instanceId 重连恢复。
 //
@@ -153,6 +153,7 @@ export class BrowserConnection extends EventEmitter {
       case EV.DIALOG: this.emit('dialog', p); return;
       case EV.BADGES: this.emit('badge', p); return;
       case EV.WEBMCP_TOOLS: this.emit('webmcp', p); return; // {tabId, kind, toolNames}
+      case EV.SCREENCAST_FRAME: this.emit('screencast', p); return; // {tabId, data, ts, metadata}
       default: this.emit('notification', msg); return;
     }
   }

@@ -21,7 +21,7 @@ const HOST_NAME = 'com.chromeagentbrowser.host'; // native messaging 宿主名�
 const ALARM_RECONNECT = 'ab-reconnect';
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000]; // 重连退避，30s 封顶
 const REQ_TIMEOUT_MS = 20000;   // 出站 JSON-RPC 请求超时
-const CAPABILITIES = ['cdp', 'screenshot', 'ax', 'locator', 'history', 'downloads', 'dialogs', 'viewport', 'webmcp'];
+const CAPABILITIES = ['cdp', 'screenshot', 'ax', 'locator', 'history', 'downloads', 'dialogs', 'viewport', 'webmcp', 'screencast'];
 const LEASE_KEY = 'ab_leases';      // chrome.storage.session
 const SESSION_KEY = 'ab_session';   // chrome.storage.session
 const VIEWPORT_KEY = 'ab_viewport'; // chrome.storage.session
@@ -31,6 +31,7 @@ const MAX_DEV_LOGS = 200;           // 每 tab 控制台日志环容量
 const SNAPSHOT_MAX = 200 * 1024;    // locator_snapshot 截断 200KB
 const WEBMCP_LIST_WAIT_MS = 2000;   // WebMCP.enable 后等 toolsAdded 事件的上限
 const WEBMCP_INVOKE_WAIT_MS = 12000;// 等页面工具 execute 完成的上限（须低于 service 命令 15s 超时）
+const SCREENCAST_MIN_INTERVAL_MS = 250; // 同 tab 投屏帧转发最小间隔（控流量；中间帧丢弃保最新）
 
 // JSON-RPC 错误码（拷贝自 shared/protocol.mjs ERR）
 const ERR = {
@@ -58,6 +59,7 @@ const EV = {
   DIALOG: 'onJsDialog',
   BADGES: 'onBadgeChange',
   WEBMCP_TOOLS: 'onWebmcpTools', // v0.2.1 推送式发现（曾因硬拷贝漏加此行导致静默丢事件——见 test/sync.test.mjs）
+  SCREENCAST_FRAME: 'onScreencastFrame', // v0.4.0 实时投屏帧（已 ack + 250ms 节流后转发）
 };
 
 // CDP 白名单（硬拷贝 shared/protocol.mjs CDP_ALLOWLIST；tab_cdp_call 默认拒绝）
@@ -67,6 +69,7 @@ const CDP_ALLOWLIST = new Set([
   'Page.getResourceContent', 'Page.getNavigationHistory', 'Page.navigateToHistoryEntry',
   'Page.handleJavaScriptDialog', 'Page.setLifecycleEventsEnabled', 'Page.addScriptToEvaluateOnNewDocument',
   'Page.removeScriptToEvaluateOnNewDocument', 'Page.setInterceptFileChooserDialog', 'Page.setDownloadBehavior',
+  'Page.startScreencast', 'Page.stopScreencast', 'Page.screencastFrameAck',
   'Runtime.enable', 'Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.getProperties',
   'Runtime.releaseObject', 'Runtime.discardConsoleEntries', 'Runtime.addBinding', 'Runtime.removeBinding',
   'DOM.enable', 'DOM.getDocument', 'DOM.describeNode', 'DOM.getBoxModel', 'DOM.getContentQuads',
@@ -102,6 +105,7 @@ const st = {
   webmcpTools: new Map(),        // tabId -> Map(name -> CDP WebMCP.Tool)
   webmcpAddedWaiters: new Map(), // tabId -> [resolve]（等 toolsAdded 的命令挂起处）
   webmcpInvokeWaiters: new Map(),// invocationId -> resolve(params)（等 toolResponded）
+  screencasts: new Map(),        // tabId -> {lastSentAt, pending, timer}（投屏中登记 + 节流状态）
 };
 
 function log(...args) { try { console.log('[ab]', ...args); } catch (e) { /* noop */ } }
@@ -655,6 +659,12 @@ async function cmdSessionFinalize(p) {
     if (lease.origin === 'agent' && !keep.has(lease.tabId)) toClose.push(lease.tabId);
   }
   await persistLeases();
+  // 本会话仍在投屏的标签页（含保留页）一律停投屏：会话结束不该留着帧流
+  for (const lease of mine) {
+    if (st.screencasts.has(lease.tabId)) {
+      try { await screencastTeardown(lease.tabId); } catch (e) { /* 忽略 */ }
+    }
+  }
   for (const tabId of toClose) {
     try { await detachTab(tabId); } catch (e) { /* 忽略 */ }
     try { await chrome.tabs.remove(tabId); } catch (e) { /* 已关闭则忽略 */ }
@@ -1330,6 +1340,90 @@ async function cmdWebmcpInvokeTool(p) {
   throw abErr(ERR.INTERNAL, 'WebMCP 工具 ' + p.name + ' 失败: ' + String(detail));
 }
 
+// ---- 实时投屏（v0.4.0；Page.startScreencast 帧流，ab_screencast 的底层通道） ----
+//
+// start：ensureAttached → Page.startScreencast（jpeg，默认 quality 60 / 1280x800 /
+//   everyNthFrame 1），并把该 tab 登记为投屏中（st.screencasts）。
+// 帧：chrome.debugger.onEvent 收到 Page.screencastFrame → 必须立即回
+//   Page.screencastFrameAck{sessionId}（不回浏览器会停止发帧）→ 节流后经
+//   onScreencastFrame 通知 service（同 tab 最多每 250ms 一帧，中间帧丢弃保最新）。
+//   帧不进通用 CDP 事件环 / onCDPEvent（jpeg base64 体积大，环形缓冲会被冲爆）。
+// stop：Page.stopScreencast + 除名（幂等）；tab 关闭 / debugger onDetach /
+//   session_finalize 时自动 stop。
+
+async function cmdScreencastStart(p) {
+  await ensureAttached(p.tabId);
+  const params = {
+    format: 'jpeg',
+    quality: typeof p.quality === 'number' ? Math.max(1, Math.min(100, Math.round(p.quality))) : 60,
+    maxWidth: typeof p.maxWidth === 'number' ? Math.max(1, Math.round(p.maxWidth)) : 1280,
+    maxHeight: typeof p.maxHeight === 'number' ? Math.max(1, Math.round(p.maxHeight)) : 800,
+    everyNthFrame: typeof p.everyNthFrame === 'number' ? Math.max(1, Math.round(p.everyNthFrame)) : 1,
+  };
+  await cdpSend(p.tabId, 'Page.startScreencast', params);
+  screencastDrop(p.tabId); // 清掉旧节流状态再登记（重复 start 视为重启）
+  st.screencasts.set(p.tabId, { lastSentAt: 0, pending: null, timer: null });
+  return { ok: true };
+}
+
+async function cmdScreencastStop(p) {
+  screencastDrop(p.tabId);
+  if (st.attached.has(p.tabId)) {
+    try { await cdpSend(p.tabId, 'Page.stopScreencast', {}); } catch (e) { /* 已断开则忽略 */ }
+  }
+  return { ok: true };
+}
+
+// 除名 + 清节流定时器（不发 CDP；onRemoved/onDetach/重启 start 复用）
+function screencastDrop(tabId) {
+  const entry = st.screencasts.get(tabId);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  st.screencasts.delete(tabId);
+}
+
+// 除名 + 尽力 stopScreencast（仍 attach 时；finalize 等主动收尾用）
+async function screencastTeardown(tabId) {
+  screencastDrop(tabId);
+  if (st.attached.has(tabId)) {
+    try { await cdpSend(tabId, 'Page.stopScreencast', {}); } catch (e) { /* 忽略 */ }
+  }
+}
+
+// Page.screencastFrame → 节流转发 onScreencastFrame{tabId, data, ts, metadata 摘要}
+function screencastOnFrame(tabId, params) {
+  const entry = st.screencasts.get(tabId);
+  if (!entry) return; // 未登记（如 ab_cdp 手动 startScreencast）→ 只 ack 不转发
+  const data = params && typeof params.data === 'string' ? params.data : '';
+  if (!data) return;
+  const md = (params && params.metadata && typeof params.metadata === 'object') ? params.metadata : {};
+  const frame = {
+    tabId, data, ts: Date.now(),
+    metadata: {
+      offsetTop: md.offsetTop, pageScaleFactor: md.pageScaleFactor,
+      deviceWidth: md.deviceWidth, deviceHeight: md.deviceHeight,
+    },
+  };
+  const now = Date.now();
+  const since = now - entry.lastSentAt;
+  if (since >= SCREENCAST_MIN_INTERVAL_MS) {
+    entry.lastSentAt = now;
+    sendNotification(EV.SCREENCAST_FRAME, frame);
+    return;
+  }
+  // 节流窗口内：丢弃中间帧保最新，窗口到期补发最后一帧
+  entry.pending = frame;
+  if (entry.timer) return;
+  entry.timer = setTimeout(() => {
+    entry.timer = null;
+    if (!entry.pending || !st.screencasts.has(tabId)) return;
+    const f = entry.pending;
+    entry.pending = null;
+    entry.lastSentAt = Date.now();
+    sendNotification(EV.SCREENCAST_FRAME, f);
+  }, SCREENCAST_MIN_INTERVAL_MS - since);
+}
+
 // ---- 下载 ----
 
 async function cmdDownloadConfigSpecs() {
@@ -1394,6 +1488,9 @@ const REGISTRY = {
   webmcp_list_tools: { spec: { tabId: 'number' }, fn: cmdWebmcpListTools },
   webmcp_invoke_tool: { spec: { tabId: 'number', name: 'string', args: 'object?' }, fn: cmdWebmcpInvokeTool },
 
+  screencast_start: { spec: { tabId: 'number', everyNthFrame: 'number?', quality: 'number?', maxWidth: 'number?', maxHeight: 'number?' }, fn: cmdScreencastStart },
+  screencast_stop: { spec: { tabId: 'number' }, fn: cmdScreencastStop },
+
   download_config_specs: { spec: {}, fn: cmdDownloadConfigSpecs },
   download_open: { spec: { downloadId: 'number' }, fn: cmdDownloadOpen },
 };
@@ -1449,6 +1546,7 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   st.attached.delete(tabId);
   st.injected.delete(tabId);
+  screencastDrop(tabId); // 投屏随 tab 消失，无需再发 stopScreencast
   st.cdpRings.delete(tabId);
   st.logRings.delete(tabId);
   st.dialogs.delete(tabId);
@@ -1462,6 +1560,14 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source && source.tabId;
   if (tabId === undefined) return;
+  if (method === 'Page.screencastFrame') {
+    // 立即 ack（不回浏览器会停止发帧）→ 节流转发专用通道；不入通用事件环/onCDPEvent
+    const sid = params && params.sessionId;
+    cdpSend(tabId, 'Page.screencastFrameAck', sid !== undefined ? { sessionId: sid } : {})
+      .catch(() => { /* ack 失败（已断开）：帧流随 attach 一起死，无需处理 */ });
+    screencastOnFrame(tabId, params);
+    return;
+  }
   if (method === 'Page.javascriptDialogOpening') {
     st.dialogs.set(tabId, params || {});
     sendNotification(EV.DIALOG, { tabId, dialog: params || {} });
@@ -1501,6 +1607,7 @@ chrome.debugger.onDetach.addListener(async (source, reason) => {
   if (tabId === undefined) return;
   st.attached.delete(tabId);
   st.injected.delete(tabId);
+  screencastDrop(tabId); // attach 没了帧流即断：登记清掉，避免残留状态
   sendNotification(EV.CDP_DETACH, { tabId, reason: reason || 'unknown' });
 });
 

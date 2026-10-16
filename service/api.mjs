@@ -21,6 +21,10 @@ import { z } from 'zod';
 import { ERR, CDP_ALLOWLIST } from '../shared/protocol.mjs';
 import { createPlaywright } from './locator.mjs';
 
+// ---- 实时投屏常量（v0.4.0）----
+const MAX_SCREENCAST_FRAMES = 20;          // 每 tab 环形缓存的最近帧数（超限丢最旧）
+const SCREENCAST_FIRST_FRAME_WAIT_MS = 3000; // lazy start 后等首帧的上限
+
 // ---- zod 入参校验（只校验关键参数，宽松不动业务字段） ----
 const zNewTab = z.object({
   url: z.string().min(1).optional(),
@@ -148,7 +152,7 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
 
   function wrapBrowser(conn) {
     if (wrapped.has(conn)) return wrapped.get(conn);
-    const state = { sessionId: null, turnId: null, tabCount: 0, pageCache: new Map(), tabs: new Map(), webmcpCache: new Map() };
+    const state = { sessionId: null, turnId: null, tabCount: 0, pageCache: new Map(), tabs: new Map(), webmcpCache: new Map(), screencastRing: new Map(), screencastCasting: new Set() };
     watchWebmcp(conn); // 工具变化通知进收件箱（webmcpHint 的数据源）
 
     // page 事件 → tab 缓存 {url,title,removed}
@@ -157,8 +161,22 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
       const c = state.pageCache.get(p.tabId) ?? {};
       if (p.url !== undefined) c.url = p.url;
       if (p.title !== undefined) c.title = p.title;
-      if (p.event === 'removed') c.removed = true;
+      if (p.event === 'removed') {
+        c.removed = true;
+        state.screencastRing.delete(p.tabId); // tab 关闭（扩展侧已自动 stop）：清帧缓存
+        state.screencastCasting.delete(p.tabId);
+      }
       state.pageCache.set(p.tabId, c);
+    });
+
+    // screencast 帧（onScreencastFrame）→ 每 tab 环形缓存最近 MAX_SCREENCAST_FRAMES 帧。
+    // 帧数据只进内存缓存（只读），不进审计、不落盘。
+    conn.on('screencast', (p) => {
+      if (!p || !Number.isInteger(p.tabId) || typeof p.data !== 'string' || !p.data) return;
+      const ring = state.screencastRing.get(p.tabId) ?? [];
+      ring.push({ ts: Number.isFinite(p.ts) ? p.ts : Date.now(), data: p.data });
+      if (ring.length > MAX_SCREENCAST_FRAMES) ring.splice(0, ring.length - MAX_SCREENCAST_FRAMES);
+      state.screencastRing.set(p.tabId, ring);
     });
 
     async function ensureSession() {
@@ -241,9 +259,9 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
         },
         playwright: createPlaywright(null), // 占位，下面回填 tab 引用
         capabilities: {
-          list: () => ['cdp', 'webmcp'],
+          list: () => ['cdp', 'webmcp', 'screencast'],
           get: (id) => {
-            if (id !== 'cdp' && id !== 'webmcp') return null;
+            if (id !== 'cdp' && id !== 'webmcp' && id !== 'screencast') return null;
             if (id === 'cdp') {
               return {
                 async send(method, params = {}, opts = {}) {
@@ -265,6 +283,48 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
                     ...(limit !== undefined ? { limit } : {}),
                   });
                   return { events: r.events ?? [], cursor: r.cursor ?? 0 };
+                },
+              };
+            }
+            if (id === 'screencast') {
+              // 实时帧流：Page.startScreencast（扩展侧 250ms 节流）→ onScreencastFrame
+              // → 本地环形缓存（最近 20 帧）。默认零开销：frames() 首次取帧时 lazy start。
+              return {
+                /** 开始投屏（通常无需手动调——frames() 已 lazy start）。 */
+                async start(opts = {}) {
+                  const extra = {};
+                  for (const k of ['everyNthFrame', 'quality', 'maxWidth', 'maxHeight']) {
+                    if (opts[k] !== undefined) extra[k] = opts[k];
+                  }
+                  await call('screencast_start', { tabId, ...extra });
+                  state.screencastCasting.add(tabId);
+                },
+                /** 停止投屏并清空该 tab 的帧缓存（幂等；tab 关闭时也会自动清）。 */
+                async stop() {
+                  state.screencastCasting.delete(tabId);
+                  state.screencastRing.delete(tabId);
+                  try { await call('screencast_stop', { tabId }); }
+                  catch (err) { throw mapRpcError(err, `tab ${tabId}: `); }
+                },
+                /**
+                 * 取最近帧（时间正序，最新在末尾）。无缓存且未投屏时自动 lazy start 并等
+                 * 首帧（至多 3s）；sinceTs 只取其之后的帧；limit 取最新的 N 帧（默认 1）。
+                 * @returns {Promise<Array<{ts:number, data:string}>>} data 为 jpeg base64。
+                 */
+                async frames({ limit = 1, sinceTs } = {}) {
+                  if (!(state.screencastRing.get(tabId) ?? []).length && !state.screencastCasting.has(tabId)) {
+                    await this.start();
+                    const deadline = Date.now() + SCREENCAST_FIRST_FRAME_WAIT_MS;
+                    while ((state.screencastRing.get(tabId) ?? []).length === 0 && Date.now() < deadline) {
+                      await new Promise((r) => setTimeout(r, 50));
+                    }
+                  }
+                  let items = state.screencastRing.get(tabId) ?? [];
+                  if (sinceTs !== undefined && Number.isFinite(sinceTs)) {
+                    items = items.filter((f) => f.ts > sinceTs);
+                  }
+                  const lim = Number.isInteger(limit) && limit > 0 ? limit : 1;
+                  return items.slice(-lim).map((f) => ({ ...f }));
                 },
               };
             }

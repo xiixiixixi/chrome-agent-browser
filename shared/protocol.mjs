@@ -28,6 +28,9 @@ export const EV = {
   // 页面申报的 WebMCP 工具发生变化（扩展在 WebMCP.enable 后收到 toolsAdded/toolsRemoved
   // 或主文档换页时上报）。toolNames 是该 tab 当前的完整工具名清单快照（非增量）。
   WEBMCP_TOOLS: 'onWebmcpTools', // {tabId, kind:'added'|'removed'|'changed', toolNames:[string]}
+  // 实时投屏帧（v0.4.0）。扩展收到 Page.screencastFrame 已立即 ack，并按 250ms/tab 节流
+  // （中间帧丢弃保最新）后转发；data 为 jpeg base64，metadata 只留关键字段摘要。
+  SCREENCAST_FRAME: 'onScreencastFrame', // {tabId, data, ts, metadata}
 };
 
 // Service -> extension commands. Method name === command type (flat).
@@ -94,6 +97,13 @@ export const COMMANDS = {
   webmcp_list_tools: { params: { tabId: 'number' }, returns: { tools: 'array' } },
   webmcp_invoke_tool: { params: { tabId: 'number', name: 'string', args: 'object?' }, returns: { result: 'any' } },
 
+  // 实时投屏（v0.4.0，ab_screencast 用；帧经 onScreencastFrame 通知上行，不走命令）
+  // start：ensureAttached → Page.startScreencast{format:'jpeg', quality 默认 60,
+  //   maxWidth 默认 1280, maxHeight 默认 800, everyNthFrame 默认 1}，并登记该 tab 投屏中。
+  // stop：Page.stopScreencast + 除名（幂等；tab 关闭/租约清理/finalize 时扩展自动 stop）。
+  screencast_start: { params: { tabId: 'number', everyNthFrame: 'number?', quality: 'number?', maxWidth: 'number?', maxHeight: 'number?' }, returns: { ok: 'boolean' } },
+  screencast_stop: { params: { tabId: 'number' }, returns: { ok: 'boolean' } },
+
   // downloads (approval-gated in service)
   download_config_specs: { params: {} },
   download_open: { params: { downloadId: 'number' } },
@@ -106,6 +116,7 @@ export const CDP_ALLOWLIST = new Set([
   'Page.getResourceContent', 'Page.getNavigationHistory', 'Page.navigateToHistoryEntry',
   'Page.handleJavaScriptDialog', 'Page.setLifecycleEventsEnabled', 'Page.addScriptToEvaluateOnNewDocument',
   'Page.removeScriptToEvaluateOnNewDocument', 'Page.setInterceptFileChooserDialog', 'Page.setDownloadBehavior',
+  'Page.startScreencast', 'Page.stopScreencast', 'Page.screencastFrameAck',
   'Runtime.enable', 'Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.getProperties',
   'Runtime.releaseObject', 'Runtime.discardConsoleEntries', 'Runtime.addBinding', 'Runtime.removeBinding',
   'DOM.enable', 'DOM.getDocument', 'DOM.describeNode', 'DOM.getBoxModel', 'DOM.getContentQuads',
