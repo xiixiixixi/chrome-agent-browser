@@ -6,12 +6,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { ConnectionManager } from '../service/connection.mjs';
 import { createAgentApi } from '../service/api.mjs';
 import { loadPolicy } from '../service/policy.mjs';
+import { createAudit } from '../service/audit.mjs';
 import { startMockExtension } from '../service/mock-extension.mjs';
 import { buildMcpServer } from '../service/mcp.mjs';
 
@@ -25,17 +29,18 @@ const ELEMENT_PNG_B64 =
 const ALL_TOOLS = [
   'ab_list_browsers', 'ab_status', 'ab_visibility', 'ab_viewport', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
   'ab_screenshot', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open', 'ab_read_urls',
-  'ab_confirm', 'ab_webmcp', 'browser_eval',
+  'ab_confirm', 'ab_webmcp', 'ab_audit', 'browser_eval',
 ];
 
 /** 起 MCP 栈：service 组装（同 service.test.mjs，简化）+ MCP server/client 对连 + 伪扩展。 */
 async function startMcpStack(mockOpts = {}) {
-  const manager = new ConnectionManager({ port: 0 });
+  const audit = createAudit({ dir: mkdtempSync(join(tmpdir(), 'ab-mcp-audit-')) }); // 审计目录 = 独立临时目录
+  const manager = new ConnectionManager({ port: 0, audit });
   await manager.start();
-  const policy = loadPolicy(null); // 默认策略：拦 chrome://settings/*、download_open 需确认、Fetch.enable 需确认
+  const policy = loadPolicy(null, { audit }); // 默认策略：拦 chrome://settings/*、download_open 需确认、Fetch.enable 需确认
   const api = createAgentApi(() => manager.liveConnections(), { policy });
 
-  const server = buildMcpServer({ api, policy, connections: () => manager.liveConnections() });
+  const server = buildMcpServer({ api, policy, connections: () => manager.liveConnections(), audit });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: 'mcp-test', version: '0.0.1' });
@@ -70,7 +75,7 @@ async function startMcpStack(mockOpts = {}) {
     await server.close();
     await manager.stop();
   }
-  return { manager, policy, api, server, client, mock, call, callJson, close };
+  return { manager, policy, api, audit, server, client, mock, call, callJson, close };
 }
 
 test('tools/list 包含全部工具（ab_* + browser_eval）', async () => {
@@ -507,5 +512,43 @@ test('ab_read_urls：maxChars 截断正文并标记 truncated；不给则默认 
     const r2 = await s.callJson('ab_read_urls', { urls: ['https://long.example/'] });
     assert.equal(r2.pages[0].text.length, 500);
     assert.equal(r2.pages[0].truncated, undefined);
+  } finally { await s.close(); }
+});
+
+test('ab_audit：查询到本会话的副作用命令留痕（倒序、cmd 过滤、tabId 过滤）', async () => {
+  const s = await startMcpStack();
+  try {
+    const { tabId } = await s.callJson('ab_new_tab', { url: 'https://audit-mcp.example/' });
+    await s.callJson('ab_navigate', { tabId, url: 'https://audit-mcp.example/page2' });
+    await s.callJson('ab_tab_info', { tabId }); // 读命令：不留痕
+
+    const r = await s.callJson('ab_audit', { limit: 10 });
+    assert.ok(r.total >= 2);
+    const cmds = r.entries.map((e) => e.cmd);
+    assert.ok(cmds.includes('tab_create'));
+    assert.ok(cmds.includes('navigate_tab_url'));
+    assert.equal(r.entries[0].cmd, 'navigate_tab_url', '最新在前');
+    assert.ok(r.entries.every((e) => e.ts && typeof e.cmd === 'string'));
+
+    const only = await s.callJson('ab_audit', { cmd: 'tab_create' });
+    assert.equal(only.total, 1);
+    assert.equal(only.entries[0].paramsLite.url, 'https://audit-mcp.example/');
+
+    const byTab = await s.callJson('ab_audit', { tabId });
+    assert.ok(byTab.total >= 1);
+    assert.ok(byTab.entries.every((e) => e.tabId === tabId));
+  } finally { await s.close(); }
+});
+
+test('ab_audit：批准动作后 policy_approve 也入流水', async () => {
+  const s = await startMcpStack();
+  try {
+    const need = await s.callJson('ab_download_open', { downloadId: 9 });
+    assert.equal(need.needConfirmation, true);
+    const conf = await s.callJson('ab_confirm', { token: need.token });
+    assert.equal(conf.ok, true);
+    const r = await s.callJson('ab_audit', { cmd: 'policy_approve' });
+    assert.equal(r.total, 1);
+    assert.match(r.entries[0].paramsLite.description, /downloadId=9/);
   } finally { await s.close(); }
 });

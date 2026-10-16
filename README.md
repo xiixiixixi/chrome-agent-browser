@@ -10,7 +10,7 @@
 ┌─ 5 ─ MCP 客户端（任意支持 MCP 的 AI 工具）
 │        │ MCP over stdio（JSON-RPC 2.0）           ← service/mcp-entry.mjs（入口）
 │        ▼
-├─ 4 ─ MCP 工具面  service/mcp.mjs：17 个工具（ab_* 粗粒度 + browser_eval REPL）
+├─ 4 ─ MCP 工具面  service/mcp.mjs：18 个工具（ab_* 粗粒度 + browser_eval REPL）
 │        ▼
 ├─ 3 ─ service 命令层  service/api.mjs（Agent API）+ policy.mjs（策略门）
 │        + connection.mjs（WS 服务端 / 租约镜像 / 心跳）
@@ -85,7 +85,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
   端口已占用后自动切换为「前端模式」连接既有服务，共享同一个浏览器连接；全部客户端退出后
   最后一个 service 进程退出，不留孤儿进程。
 
-## MCP 工具面（17 个）
+## MCP 工具面（18 个）
 
 | 工具 | 作用 |
 |---|---|
@@ -98,12 +98,14 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | `ab_claim_tab` | 认领一个已开的用户标签页（标题/网址三重匹配，防认错） |
 | `ab_cdp` / `ab_download_open` | 原样 CDP（白名单+确认门）/ 打开下载文件（确认门） |
 | `ab_confirm` | 批准一次待确认动作（5 分钟一次性令牌） |
+| `ab_audit` | **审计流水**：查询 AI 对浏览器的操作留痕（本地 `audit/` 目录；按命令/标签页/时间过滤，回答"我刚才动了什么/这个标签页被做过什么"） |
 | `ab_webmcp` | **WebMCP**：发现/调用网页自己申报的结构化工具（`action:list\|invoke`；非只读工具过确认门）。页面申报的工具会**自动提示**：`ab_tab_info`/导航返回的 `webmcpHint` 与运行中的日志推送，无提示再手动 list |
 | `browser_eval` | **核心特色**：给 agent 一段代码，内含完整 API 对象 `agent`，一次完成「看页面→操作→验证」循环 |
 
 ## 安全模型
 
 - **租约可见**：被 agent 控制的标签页进专属标签组 + 橙色 ● 角标；谁借走哪个页面有据可查。
+- **审计日志**：AI 的每次浏览器操作本地留痕（`audit/` 目录 JSONL，只记有副作用的命令与人工确认，敏感值脱敏；可用 `ab_audit` 查询，host-config 设 `auditDisabled:true` 或 `CAB_AUDIT=off` 可关闭）。
 - **策略门**（`service/policy-defaults.json` 可自定义）：默认拦截 `chrome://settings` 等敏感页；危险动作（打开下载文件、部分 CDP）需人工确认令牌放行；未知动作类型一律拒绝（fail-closed）。
 - **CDP 白名单**：`shared/protocol.mjs` 的 `CDP_ALLOWLIST` 之外的调试指令，服务端直接拒绝，到不了浏览器。
 - **默认后台**：浏览器窗口默认不抢焦点，按需可见。
@@ -125,7 +127,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 ## 测试
 
 ```bash
-npm test          # 65 个单元测试
+npm test          # 81 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
 npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听，逐项给修复建议
 npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome）

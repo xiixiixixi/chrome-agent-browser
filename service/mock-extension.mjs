@@ -24,6 +24,7 @@ function defaultHandler(method, params, respond, fail) {
     case 'navigate_tab_url': case 'navigate_tab_back': case 'navigate_tab_forward':
     case 'navigate_tab_reload': case 'tab_close': case 'tab_mark': case 'tab_ax_action':
     case 'tab_get_js_dialog': case 'tab_handle_js_dialog': case 'download_config_specs':
+    case 'download_open':
       respond({});
       return;
     case 'browser_viewport_get':

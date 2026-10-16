@@ -6,6 +6,7 @@
 //   - download_open / cdp：confirmActions / confirmCdp 需要人工确认
 // 确认流程：check() 返回 {needConfirmation:true, token}；policy.approve(token) 批准后，
 // 带 {confirmationToken: token} 重试同一动作即放行（token 一次性、内存保存 5 分钟）。
+// 审计（v0.3.1）：构造时可传 {audit}，approve 成功即留痕一条 policy_approve 事件。
 
 import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -36,7 +37,8 @@ export function wildcardMatch(pattern, url) {
 }
 
 export class Policy {
-  constructor(rules = {}) {
+  constructor(rules = {}, { audit = null } = {}) {
+    this.audit = audit; // approve 成功留痕（service/audit.mjs）
     this.rules = {
       blockedUrlPatterns: Array.isArray(rules.blockedUrlPatterns) ? rules.blockedUrlPatterns : [],
       confirmActions: Array.isArray(rules.confirmActions) ? rules.confirmActions : [],
@@ -103,6 +105,7 @@ export class Policy {
     const rec = typeof token === 'string' ? this._tokens.get(token) : null;
     if (!rec || rec.expiresAt <= Date.now()) return { ok: false, reason: 'unknown or expired token' };
     rec.approved = true;
+    if (this.audit) this.audit.recordApprove(rec.description); // 确认事件留痕（失败自吞）
     return { ok: true, description: rec.description };
   }
 
@@ -141,8 +144,8 @@ export class Policy {
   }
 }
 
-/** 从 JSON 文件加载策略；path 为空时用内置默认 policy-defaults.json。 */
-export function loadPolicy(path) {
+/** 从 JSON 文件加载策略；path 为空时用内置默认 policy-defaults.json。opts.audit 透传给 Policy。 */
+export function loadPolicy(path, opts = {}) {
   const file = path ?? DEFAULTS_PATH;
   let raw;
   try {
@@ -150,5 +153,5 @@ export function loadPolicy(path) {
   } catch (err) {
     throw new Error(`cannot load policy file ${file}: ${err.message}`);
   }
-  return new Policy(raw);
+  return new Policy(raw, opts);
 }

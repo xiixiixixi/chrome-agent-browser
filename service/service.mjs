@@ -10,13 +10,14 @@
 
 import process from 'node:process';
 import { once } from 'node:events';
-import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { ConnectionManager } from './connection.mjs';
 import { createAgentApi } from './api.mjs';
 import { loadPolicy } from './policy.mjs';
+import { createAudit } from './audit.mjs';
 import { startMockExtension } from './mock-extension.mjs';
 import { ERR } from '../shared/protocol.mjs';
 
@@ -102,18 +103,19 @@ export async function main(argv = process.argv.slice(2)) {
     return ok ? 0 : 1;
   }
 
-  const policy = loadPolicy(args.policy);
+  const audit = createAudit(); // 审计留痕（host-config auditDisabled:true / CAB_AUDIT=off 可关）
+  const policy = loadPolicy(args.policy, { audit });
   // 与 mcp-entry 一致：未显式给 --port 时，优先用 setup 写入的 host-config.json
   //（浏览器扩展的宿主按这份配置拨号；两边端口不一致 = 永远连不上）
   if (!process.argv.includes('--port')) {
     try {
-      const cfg = JSON.parse(readFileSync(resolve(path.dirname(fileURLToPath(import.meta.url)), 'host-config.json'), 'utf8'));
+      const cfg = JSON.parse(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../host/host-config.json'), 'utf8'));
       if (Number.isInteger(cfg.servicePort) && cfg.servicePort > 0 && cfg.servicePort < 65536) args.port = cfg.servicePort;
     } catch { /* 无配置文件则用默认端口 */ }
   }
-  const manager = new ConnectionManager({ port: args.port });
+  const manager = new ConnectionManager({ port: args.port, audit });
   await manager.start();
-  console.log(`[cab-service] listening ws://127.0.0.1:${manager.port} (protocol v1, policy: ${args.policy ?? 'defaults'})`);
+  console.log(`[cab-service] listening ws://127.0.0.1:${manager.port} (protocol v1, policy: ${args.policy ?? 'defaults'}; audit: ${audit.disabled ? 'off' : audit.dir})`);
   manager.on('browser', (c) => console.log(`[browser] connected ${c.instanceId} (${c.family} ${c.browserVersion ?? ''})${c.restored ? ' [restored]' : ''}`));
   manager.on('browserClosed', (c) => console.log(`[browser] closed ${c.instanceId}; lease mirror retained for reconnect window`));
 

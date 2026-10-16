@@ -18,6 +18,9 @@
 //     浏览器连接执行，结果/错误原样回传（保留错误 code）；无浏览器回 -32002。
 //   - frontendSockets（Set）维护 frontend 计数，增减时触发 'frontendCountChange'。
 //   - 浏览器全部断开时主动断开所有 frontend（给前端一个明确的「共用浏览器没了」信号）。
+//
+// 审计（v0.3.1）：opts.audit（service/audit.mjs 的实例）非空时，cmd() 出站路径上按
+//   白名单留痕副作用命令；frontend 代理的命令同样经 BrowserConnection.cmd，天然覆盖。
 
 import { EventEmitter } from 'node:events';
 import { WebSocketServer } from 'ws';
@@ -34,6 +37,7 @@ const DEFAULTS = {
   heartbeatTimeoutMs: null,    // 默认 max(2000, interval/2)
   heartbeatMaxFailures: 3,
   leaseMirrorTtlMs: 60_000,
+  audit: null, // service/audit.mjs 实例；缺省不留痕
 };
 
 /** 单个浏览器连接（一个 WS = 一个 host + 一个浏览器）。 */
@@ -73,6 +77,7 @@ export class BrowserConnection extends EventEmitter {
     }
     return new Promise((resolve, reject) => {
       if (this.isClosed) { reject(this._err('connection closed', -32000)); return; }
+      if (this.manager.audit) this.manager.audit.record(method, params); // 审计：副作用命令出站留痕（失败自吞）
       const id = this.nextId++;
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -281,6 +286,7 @@ export class ConnectionManager extends EventEmitter {
   constructor(opts = {}) {
     super();
     this.opts = { ...DEFAULTS, ...opts };
+    this.audit = this.opts.audit ?? null; // 审计实例（cmd() 咽喉点引用）
     this.wss = null;
     this.connections = new Set();
     this.retained = new Map(); // instanceId -> {leases, closedAt, purgeTimer}

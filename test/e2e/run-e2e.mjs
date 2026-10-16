@@ -11,16 +11,20 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import assert from 'node:assert/strict';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 import { ConnectionManager } from '../../service/connection.mjs';
 import { createAgentApi } from '../../service/api.mjs';
 import { loadPolicy } from '../../service/policy.mjs';
+import { createAudit } from '../../service/audit.mjs';
+import { buildMcpServer } from '../../service/mcp.mjs';
 import { ERR } from '../../shared/protocol.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -71,9 +75,12 @@ const manifest = JSON.parse(readFileSync(writtenManifests[0], 'utf8'));
 writeFileSync(join(udd, 'NativeMessagingHosts/com.chromeagentbrowser.host.json'), JSON.stringify(manifest, null, 2));
 
 // ---- 3. 服务 + 测试页 ----
-const manager = new ConnectionManager({ port });
+// 审计目录也放一次性沙箱（真实扩展/服务走完整线缆，但不往仓库 audit/ 落测试数据）
+const AUDIT_DIR = mkdtempSync(join(tmpdir(), 'ab-e2e-audit-'));
+const audit = createAudit({ dir: AUDIT_DIR });
+const manager = new ConnectionManager({ port, audit });
 await manager.start();
-const policy = loadPolicy(null);
+const policy = loadPolicy(null, { audit });
 const api = createAgentApi(() => manager.liveConnections(), { policy });
 
 const pageHtml = readFileSync(join(ROOT, 'test/e2e/page.html'), 'utf8');
@@ -303,6 +310,39 @@ try {
       const tabs = await browser.user.openTabs();
       assert.ok(!tabs.some((t) => (t.url || '').startsWith(pageUrl)));
     });
+    // 审计日志（v0.3.1）：本轮全流程的副作用命令应已留痕，且输入值脱敏
+    await step('审计日志：audit 文件含 tab_create / navigate_tab_url 留痕，fill 值不入档', async () => {
+      const files = readdirSync(AUDIT_DIR).filter((f) => /^audit-\d{8}\.jsonl/.test(f));
+      assert.ok(files.length > 0, `audit 目录应有 JSONL 文件: ${AUDIT_DIR}`);
+      const lines = files.flatMap((f) => readFileSync(join(AUDIT_DIR, f), 'utf8').split('\n')).filter(Boolean);
+      const cmds = new Set(lines.map((l) => { try { return JSON.parse(l).cmd; } catch { return null; } }));
+      assert.ok(cmds.has('tab_create'), `应含 tab_create: ${[...cmds].join(',')}`);
+      assert.ok(cmds.has('navigate_tab_url'), '应含 navigate_tab_url');
+      assert.ok(cmds.has('tab_close'), '应含 tab_close');
+      assert.ok(cmds.has('locator_action'), '应含 locator_action');
+      const text = lines.join('\n');
+      assert.ok(!text.includes('张三'), 'fill 输入值不得进入审计日志');
+    });
+    await step('ab_audit：MCP 工具能查询到审计流水（倒序、可过滤）', async () => {
+      const server = buildMcpServer({ api, policy, audit, connections: () => manager.liveConnections() });
+      const [ct, st] = InMemoryTransport.createLinkedPair();
+      await server.connect(st);
+      const client = new Client({ name: 'ab-e2e', version: '0' });
+      await client.connect(ct);
+      try {
+        const res = await client.callTool({ name: 'ab_audit', arguments: { limit: 500 } });
+        assert.ok(!res.isError, JSON.stringify(res.content).slice(0, 200));
+        const r = JSON.parse(res.content.find((c) => c.type === 'text').text);
+        assert.ok(r.total >= 4, `total 应覆盖本轮操作: ${r.total}`);
+        assert.ok(r.entries.some((e) => e.cmd === 'tab_create'));
+        assert.ok(r.entries.some((e) => e.cmd === 'navigate_tab_url'));
+        assert.ok(r.entries[0].ts >= r.entries[r.entries.length - 1].ts, '倒序（最新在前）');
+        const filtered = await client.callTool({ name: 'ab_audit', arguments: { cmd: 'navigate_tab_url', limit: 500 } });
+        const fr = JSON.parse(filtered.content.find((c) => c.type === 'text').text);
+        assert.ok(fr.total >= 1);
+        assert.ok(fr.entries.every((e) => e.cmd === 'navigate_tab_url'));
+      } finally { await client.close(); await server.close(); }
+    });
   }
 } finally {
   // ---- 6. 清理（只删自己写的；杀整个 Chrome 进程组防僵尸） ----
@@ -321,6 +361,7 @@ try {
   if (leftover) console.log(`[e2e] 警告：清理竞态残留 ${leftover} 份清单，已终扫删除`);
   // 还原用户真实 host-config（安装器在测试中重写了端口）
   if (hostConfigBackup !== null) writeFileSync(hostConfigPath, hostConfigBackup);
+  try { rmSync(AUDIT_DIR, { recursive: true, force: true }); } catch { /* noop */ }
   console.log(`[e2e] 清理完成（浏览器/服务/测试页/临时目录/${writtenManifests.length} 份清单）`);
 }
 

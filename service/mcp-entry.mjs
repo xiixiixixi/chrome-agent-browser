@@ -29,6 +29,7 @@ import { ConnectionManager } from './connection.mjs';
 import { RemoteFrontend } from './remote-frontend.mjs';
 import { createAgentApi } from './api.mjs';
 import { loadPolicy } from './policy.mjs';
+import { createAudit } from './audit.mjs';
 import { buildMcpServer } from './mcp.mjs';
 import { parseArgs, runSelfTest } from './service.mjs';
 
@@ -39,9 +40,9 @@ const FRONTEND_DRAIN_GRACE_MS = 60_000; // stdin EOF 后等 frontend 排水的�
 const log = (...a) => process.stderr.write(`${a.join(' ')}\n`);
 
 /** 尝试接管端口成为 service（后端死亡恢复用）。成功返回新 ConnectionManager；端口被占返回 null。 */
-export async function attemptServiceTakeover(port) {
+export async function attemptServiceTakeover(port, audit = null) {
   try {
-    const m = new ConnectionManager({ port });
+    const m = new ConnectionManager({ port, audit });
     await m.start();
     return m;
   } catch (err) {
@@ -69,13 +70,14 @@ export async function main(argv = process.argv.slice(2)) {
       if (Number.isInteger(cfg.servicePort) && cfg.servicePort > 0 && cfg.servicePort < 65536) args.port = cfg.servicePort;
     } catch { /* 无配置文件则用默认端口 */ }
   }
-  const policy = loadPolicy(args.policy);
+  const audit = createAudit(); // 审计日志（host-config auditDisabled:true / CAB_AUDIT=off 可关；frontend 与 service 落盘同一目录）
+  const policy = loadPolicy(args.policy, { audit });
 
   // ---- 抢 service 端口：抢到 → service 模式；EADDRINUSE → 前端模式连既有 service ----
   let manager = null;
   let remoteFrontend = null;
   try {
-    manager = new ConnectionManager({ port: args.port });
+    manager = new ConnectionManager({ port: args.port, audit });
     await manager.start();
   } catch (err) {
     if (!err || err.code !== 'EADDRINUSE') throw err;
@@ -93,7 +95,7 @@ export async function main(argv = process.argv.slice(2)) {
   const getConnections = () => (manager ? manager.liveConnections() : remoteFrontend.liveConnections());
   const api = createAgentApi(getConnections, { policy });
   const serviceInfo = { mode: manager ? 'service' : 'frontend', startedAt: Date.now(), port: args.port };
-  const server = buildMcpServer({ api, policy, connections: getConnections, serviceInfo });
+  const server = buildMcpServer({ api, policy, connections: getConnections, serviceInfo, audit });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
@@ -104,7 +106,7 @@ export async function main(argv = process.argv.slice(2)) {
   };
 
   if (manager) {
-    log(`[cab-mcp] MCP stdio ready; service ws://127.0.0.1:${manager.port} (policy: ${args.policy ?? 'defaults'})`);
+    log(`[cab-mcp] MCP stdio ready; service ws://127.0.0.1:${manager.port} (policy: ${args.policy ?? 'defaults'}; audit: ${audit.disabled ? 'off' : audit.dir})`);
     attachManagerLogs(manager);
   } else {
     log(`[cab-mcp] frontend mode: sharing service on port ${args.port} (policy: ${args.policy ?? 'defaults'})`);
@@ -121,7 +123,7 @@ export async function main(argv = process.argv.slice(2)) {
         log(`[cab-mcp] 后端服务连接断开（${reason}），尝试恢复…`);
         await new Promise((r) => setTimeout(r, 800)); // 等端口释放/新服务稳定
         if (stopping) return;
-        const m = await attemptServiceTakeover(args.port);
+        const m = await attemptServiceTakeover(args.port, audit);
         if (m) {
           try { remoteFrontend?.stop(); } catch { /* 已断 */ }
           remoteFrontend = null;

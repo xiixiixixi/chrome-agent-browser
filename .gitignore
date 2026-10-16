@@ -9,6 +9,9 @@ host/agent-browser-host
 host/agent-browser-host.cmd
 *.bak
 
+# 审计日志（运行期本地留痕，纯机器数据不入库）
+audit/
+
 # 内部研发笔记（不对外）
 docs/REFERENCE-MAP.md
 

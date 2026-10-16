@@ -68,13 +68,14 @@ function fmtValue(v) {
 }
 
 /**
- * 构建 MCP 服务器（17 个工具）。
- * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null}} opts
+ * 构建 MCP 服务器（18 个工具）。
+ * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null, audit?: object|null}} opts
  *   api         —— createAgentApi 的返回值（必填）
  *   policy      —— service/policy.mjs 的 Policy 实例（缺省时跳过工具层策略，api 层仍可能拦）
  *   connections —— 取活连接的方式（ab_download_open / ab_viewport 需要直连 connection.cmd）
+ *   audit       —— service/audit.mjs 的审计实例（ab_audit 查询用；缺省时该工具报未装配）
  */
-export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null } = {}) {
+export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null, audit = null } = {}) {
   if (!api || typeof api.browsers?.getDefault !== 'function') {
     throw new TypeError('buildMcpServer requires { api } — createAgentApi() 的返回对象');
   }
@@ -82,7 +83,7 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
   //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
   const server = new McpServer(
-    { name: 'chrome-agent-browser', version: '0.3.0' },
+    { name: 'chrome-agent-browser', version: '0.3.1' },
     { capabilities: { logging: {} } },
   );
 
@@ -466,6 +467,27 @@ export function buildMcpServer({ api, policy = null, connections = null, service
     const browser = pickBrowser(browserId);
     const pages = await browser.tabs.content(maxChars !== undefined ? { urls, maxChars } : { urls });
     return textResult({ pages });
+  }));
+
+  // ---- 11d. ab_audit（审计日志查询：AI 的浏览器操作流水账） ----
+  server.registerTool('ab_audit', {
+    title: '审计日志查询',
+    description: '查询 AI 对浏览器做过的操作流水账（本地审计日志：audit/ 目录 JSONL，只记有副作用的命令与人工确认事件，纯本地零网络）。回答「我刚才动了什么」「这个标签页被做过哪些操作」「过去一段开了/关了/导航了哪些页」用这个。可按 cmd（如 tab_create、tab_close、navigate_tab_url、locator_action、tab_cdp_call）、tabId、since（ISO 时间，只看其后）过滤；倒序返回（最新在前）{total, entries:[{ts,cmd,tabId,session?,paramsLite,redacted?}]}；limit 默认 50、上限 500（last 等价 limit）。敏感值已脱敏：fill/press 输入与对话框文本记 "[redacted]"、CDP 参数只记键名、WebMCP 调用只记工具名。审计默认开启，host-config.json 设 auditDisabled:true 或环境变量 CAB_AUDIT=off 可关闭（关闭时返回 {disabled:true}）。',
+    inputSchema: {
+      limit: z.number().int().positive().max(500).optional().describe('返回条数上限，默认 50、最大 500'),
+      last: z.number().int().positive().optional().describe('只看最近 N 条（等价 limit，limit 优先）'),
+      cmd: z.string().min(1).optional().describe('按命令名精确过滤，如 tab_create / navigate_tab_url / locator_action / policy_approve'),
+      tabId: z.number().int().optional().describe('按标签页 id 过滤（ab_new_tab/ab_claim_tab 返回的 tabId；navigate 类/locator 类记录带它）'),
+      since: z.string().min(1).optional().describe('只看该 ISO 时间之后的条目，如 2026-10-16T08:00:00Z'),
+    },
+  }, guard(async ({ limit, last, cmd, tabId, since }) => {
+    if (!audit || typeof audit.query !== 'function') {
+      return textResult({ error: 'audit not configured（本进程未装配审计模块）' }, true);
+    }
+    if (since !== undefined && Number.isNaN(Date.parse(since))) {
+      throw new Error(`since 需为合法 ISO 时间字符串，收到: ${since}`);
+    }
+    return textResult(audit.query({ limit, last, cmd, tabId, since }));
   }));
 
   // ---- 12. browser_eval（REPL，本项目核心特色） ----
