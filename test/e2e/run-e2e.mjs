@@ -77,10 +77,28 @@ const policy = loadPolicy(null);
 const api = createAgentApi(() => manager.liveConnections(), { policy });
 
 const pageHtml = readFileSync(join(ROOT, 'test/e2e/page.html'), 'utf8');
+const page2Html = readFileSync(join(ROOT, 'test/e2e/page2.html'), 'utf8');
+const ytFixtureHtml = readFileSync(join(ROOT, 'test/e2e/youtube-fixture.html'), 'utf8');
+// json3 字幕样例（编造）：两条有效行 + 一条空行（验证配方的空行过滤）；
+// 真实 YouTube 不做网络验证（docs/recipes.md 已注明"真站效果请手动试"）
+const captionsJson3 = JSON.stringify({
+  events: [
+    { tStartMs: 0, dDurationMs: 1800, segs: [{ utf8: '大家好，' }, { utf8: '欢迎来到字幕夹具' }] },
+    { tStartMs: 2500, dDurationMs: 2000, segs: [{ utf8: '这是第二行样例字幕 second-sample-line' }] },
+    { tStartMs: 5000, segs: [{ utf8: '' }] },
+  ],
+});
 const httpPort = await freePort();
-const httpServer = createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(pageHtml); });
+const httpServer = createServer((req, res) => {
+  const path = (req.url || '/').split('?')[0];
+  if (path === '/captions.json3') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(captionsJson3); return; }
+  if (path === '/page2.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(page2Html); return; }
+  if (path === '/yt-fixture.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(ytFixtureHtml); return; }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(pageHtml);
+});
 await new Promise((r) => httpServer.listen(httpPort, '127.0.0.1', r));
 const pageUrl = `http://127.0.0.1:${httpPort}/`;
+const page2Url = `http://127.0.0.1:${httpPort}/page2.html`;
 
 // ---- 4. 启动 Chromium（加载扩展） ----
 console.log(`[e2e] 启动: ${CHROME}\n        ${headed ? '(headed)' : '(headless=new)'} user-data-dir=${udd}`);
@@ -164,6 +182,53 @@ try {
     await step('user.openTabs() 能看到本页', async () => {
       const tabs = await browser.user.openTabs();
       assert.ok(tabs.some((t) => (t.url || '').startsWith(pageUrl)), JSON.stringify(tabs.map((t) => t.url)));
+    });
+    await step('viewport：set 800x600 → get 一致 → reset 还原（直连命令）', async () => {
+      const conn = manager.liveConnections()[0];
+      await conn.cmd('browser_viewport_set', { width: 800, height: 600 });
+      const got = await conn.cmd('browser_viewport_get', {});
+      assert.deepEqual(got.viewport, { width: 800, height: 600 });
+      await conn.cmd('browser_viewport_reset', {});
+      const after = await conn.cmd('browser_viewport_get', {});
+      assert.equal(after.viewport, null, 'reset 后应无覆盖');
+    });
+    await step('元素级截图：合法 PNG 且字节数小于全页截图', async () => {
+      const full = await tab.screenshot();
+      assert.ok(Buffer.isBuffer(full) && full.length > 100 && full[0] === 0x89 && full[1] === 0x50, `full len=${full && full.length}`);
+      const elt = await tab.playwright.getByTestId('submit-btn').screenshot();
+      assert.ok(Buffer.isBuffer(elt) && elt.length > 8 && elt[0] === 0x89 && elt[1] === 0x50, `element len=${elt && elt.length}`);
+      assert.ok(elt.length < full.length, `元素截图（${elt.length}B）应小于全页（${full.length}B）`);
+    });
+    await step('批量隐形阅读：两个 URL 读回正文含关键词，临时标签读完即关', async () => {
+      const pages = await browser.tabs.content({ urls: [pageUrl, page2Url] });
+      assert.equal(pages.length, 2);
+      assert.equal(pages[0].title, 'AB-E2E 测试页');
+      assert.match(pages[0].text, /chrome-agent-browser e2e/, `第一页正文: ${pages[0].text.slice(0, 120)}`);
+      assert.equal(pages[1].title, 'AB-E2E 第二页');
+      assert.match(pages[1].text, /second-marker-9527/, `第二页正文: ${pages[1].text.slice(0, 120)}`);
+      // 临时标签已关：第二页不应残留；第一页只剩原本就在的那个 tab
+      const tabs = await browser.user.openTabs();
+      assert.ok(!tabs.some((t) => (t.url || '').startsWith(page2Url)), JSON.stringify(tabs.map((t) => t.url)));
+      assert.equal(tabs.filter((t) => (t.url || '').startsWith(pageUrl)).length, 1);
+    });
+    await step('YouTube 字幕配方：对离线夹具执行 recipes.md 的提取代码，产出样例字幕行', async () => {
+      const recipes = readFileSync(join(ROOT, 'docs/recipes.md'), 'utf8');
+      const m = recipes.match(/AB-RECIPE-YT-EXTRACT-START\s*-->\s*```js\s*\n([\s\S]*?)\n```/);
+      assert.ok(m, 'recipes.md 应含可抽取的提取代码块（AB-RECIPE-YT-EXTRACT 标记）');
+      const yt = await browser.tabs.new();
+      try {
+        await yt.goto(`http://127.0.0.1:${httpPort}/yt-fixture.html`);
+        const r = await yt.eval(m[1]);
+        assert.equal(r.ok, true, `提取应成功: ${JSON.stringify(r).slice(0, 300)}`);
+        assert.equal(r.language, 'zh-Hans', '语言优先级应选中 zh 轨');
+        assert.equal(r.lineCount, 2, `空行应被过滤: ${JSON.stringify(r.lines)}`);
+        assert.equal(r.lines[0], '[00:00] 大家好，欢迎来到字幕夹具');
+        assert.match(r.lines[1], /second-sample-line/);
+        // 非视频页（无 ytInitialPlayerResponse）→ 返回明确原因
+        const bad = await tab.eval(m[1]);
+        assert.equal(bad.ok, false);
+        assert.match(bad.reason, /非视频页/);
+      } finally { await yt.close(); }
     });
     // 条件用例：WebMCP 依赖浏览器的实验 CDP 域与页面 JS API——任一缺失时打印 SKIP 原因并算通过
     let webmcpSkip = null; // 供后续推送式发现用例复用同一 SKIP 条件

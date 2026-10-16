@@ -43,6 +43,7 @@ export const COMMANDS = {
   browser_status: { params: {} },
   browser_visibility_get: { params: {} },
   browser_visibility_set: { params: { visible: 'boolean' } },
+  browser_viewport_get: { params: {}, returns: { viewport: 'object?' } }, // {width,height}|null（null=无覆盖）
   browser_viewport_set: { params: { width: 'number', height: 'number' } },
   browser_viewport_reset: { params: {} },
   browser_history: { params: { limit: 'number?' } },
@@ -76,6 +77,8 @@ export const COMMANDS = {
   locator_count: { params: { tabId: 'number', selector: 'object' }, returns: { count: 'number' } },
   locator_action: { params: { tabId: 'number', selector: 'object', action: 'string', value: 'string?' }, returns: { ok: 'boolean', value: 'any' } },
   locator_snapshot: { params: { tabId: 'number' }, returns: { html: 'string' } },
+  // 元素级截图：__abQuery 找第一个元素 → scrollIntoView → 按其 getBoundingClientRect 裁剪截图
+  element_screenshot: { params: { tabId: 'number', selector: 'object' }, returns: { dataBase64: 'string' } },
 
   // raw CDP passthrough (scoped to attached tab)
   tab_cdp_call: { params: { tabId: 'number', method: 'string', params: 'object?' }, returns: { result: 'any' } },

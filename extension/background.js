@@ -699,6 +699,10 @@ async function cmdVisibilitySet(p) {
   return { ok: true };
 }
 
+async function cmdViewportGet() {
+  return { viewport: st.viewport || null };
+}
+
 async function cmdViewportSet(p) {
   if (!(p.width > 0 && p.height > 0 && p.width <= 10000 && p.height <= 10000)) {
     throw abErr(ERR.INVALID_PARAMS, 'width/height must be in (0, 10000]');
@@ -884,6 +888,42 @@ async function cmdTabScreenshot(p) {
   const r = await cdpSend(p.tabId, 'Page.captureScreenshot', shotParams);
   if (!r || !r.data) throw abErr(ERR.INTERNAL, 'empty screenshot');
   return { dataBase64: r.data };
+}
+
+// 元素级截图：定位器找第一个元素 → scrollIntoView → 取 getBoundingClientRect →
+// Page.captureScreenshot 带 clip 裁剪。找不到元素按 TAB_NOT_FOUND 风格报错（与定位器一致）。
+async function cmdElementScreenshot(p) {
+  await ensureAttached(p.tabId);
+  await ensureLocatorRuntime(p.tabId);
+  const expr = '(function(){try{'
+    + 'var els=window.__abQuery(' + J(p.selector) + ');'
+    + 'if(!els.length){return {ok:false,value:{__error:"no matching element"}};}'
+    + 'var el=els[0];'
+    + 'if(el.scrollIntoView){try{el.scrollIntoView({block:"center"});}catch(e){}}'
+    + 'var r=el.getBoundingClientRect();'
+    + 'return {ok:true,value:{x:r.left,y:r.top,width:r.width,height:r.height}};'
+    + '}catch(e){return {ok:false,value:{__error:String(e&&e.message||e)}};}})()';
+  const r = await cdpSend(p.tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
+  if (r && r.exceptionDetails) {
+    throw abErr(ERR.INTERNAL, 'element query threw: ' + (r.exceptionDetails.text || ''));
+  }
+  const out = r && r.result && r.result.value;
+  if (!out || !out.ok) {
+    const why = out && out.value && out.value.__error;
+    throw abErr(ERR.TAB_NOT_FOUND, 'element_screenshot: ' + (why || 'no matching element'));
+  }
+  const rect = out.value;
+  if (!(rect.width > 0 && rect.height > 0)) {
+    throw abErr(ERR.INTERNAL, 'element has no visible box (width/height <= 0)');
+  }
+  // scrollIntoView 后等一拍让渲染落定再截（clip 坐标取的是滚动后的视口系位置）
+  await new Promise((res) => setTimeout(res, 120));
+  const shot = await cdpSend(p.tabId, 'Page.captureScreenshot', {
+    format: 'png',
+    clip: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, scale: 1 },
+  });
+  if (!shot || !shot.data) throw abErr(ERR.INTERNAL, 'empty element screenshot');
+  return { dataBase64: shot.data };
 }
 
 // AX 树里值得展示的角色（可交互 + 文本类）
@@ -1237,6 +1277,7 @@ const REGISTRY = {
   browser_status: { spec: {}, fn: cmdBrowserStatus },
   browser_visibility_get: { spec: {}, fn: cmdVisibilityGet },
   browser_visibility_set: { spec: { visible: 'boolean' }, fn: cmdVisibilitySet },
+  browser_viewport_get: { spec: {}, fn: cmdViewportGet },
   browser_viewport_set: { spec: { width: 'number', height: 'number' }, fn: cmdViewportSet },
   browser_viewport_reset: { spec: {}, fn: cmdViewportReset },
   browser_history: { spec: { limit: 'number?' }, fn: cmdBrowserHistory },
@@ -1266,6 +1307,7 @@ const REGISTRY = {
   locator_count: { spec: { tabId: 'number', selector: 'object' }, fn: cmdLocatorCount },
   locator_action: { spec: { tabId: 'number', selector: 'object', action: 'string', value: 'string?' }, fn: cmdLocatorAction },
   locator_snapshot: { spec: { tabId: 'number' }, fn: cmdLocatorSnapshot },
+  element_screenshot: { spec: { tabId: 'number', selector: 'object' }, fn: cmdElementScreenshot },
 
   tab_cdp_call: { spec: { tabId: 'number', method: 'string', params: 'object?' }, fn: cmdTabCdpCall },
   tab_cdp_events: { spec: { tabId: 'number', afterSequence: 'number?', limit: 'number?' }, fn: cmdTabCdpEvents },

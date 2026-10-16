@@ -2,13 +2,15 @@
 
 一句话：让 AI 代理（agent）直接操控**你真实的、带登录态的 Chromium 系浏览器**——通过「浏览器扩展 + 原生宿主 + 本地服务」三层桥接，以 MCP（Model Context Protocol）工具面暴露给任意 MCP 客户端（Claude Code / ZCode / Cursor 等）。
 
+**纯本地架构**：所有指令只在你机器上的 127.0.0.1 里流动，不出网、无云端组件、无需账号。
+
 ## 架构（五层）
 
 ```
 ┌─ 5 ─ MCP 客户端（任意支持 MCP 的 AI 工具）
 │        │ MCP over stdio（JSON-RPC 2.0）           ← service/mcp-entry.mjs（入口）
 │        ▼
-├─ 4 ─ MCP 工具面  service/mcp.mjs：15 个工具（ab_* 粗粒度 + browser_eval REPL）
+├─ 4 ─ MCP 工具面  service/mcp.mjs：17 个工具（ab_* 粗粒度 + browser_eval REPL）
 │        ▼
 ├─ 3 ─ service 命令层  service/api.mjs（Agent API）+ policy.mjs（策略门）
 │        + connection.mjs（WS 服务端 / 租约镜像 / 心跳）
@@ -83,15 +85,16 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
   端口已占用后自动切换为「前端模式」连接既有服务，共享同一个浏览器连接；全部客户端退出后
   最后一个 service 进程退出，不留孤儿进程。
 
-## MCP 工具面（13 个）
+## MCP 工具面（17 个）
 
 | 工具 | 作用 |
 |---|---|
 | `ab_status` / `ab_list_browsers` | **服务体检**（区分"没浏览器"vs"链路断"）/ 列出受控浏览器 |
 | `ab_open_tabs` | 列出用户已开的标签页（可选 `browserId` 指定目标，如 Arc） |
 | `ab_new_tab` / `ab_tab_info` / `ab_navigate` | 开标签页 / 读信息 / 导航（过策略门） |
-| `ab_screenshot` / `ab_ax_state` | 截图（PNG）/ 无障碍树文本 |
-| `ab_visibility` | 显示/隐藏浏览器窗口（想"围观"AI 操作时 set(true)） |
+| `ab_read_urls` | **批量隐形读页**：后台开临时标签逐个读取标题+正文、读完即关，不干扰用户当前屏幕（1-10 个 URL，被策略拦的记 blocked） |
+| `ab_screenshot` / `ab_ax_state` | 截图（PNG；可选 `selector` 做元素级截图）/ 无障碍树文本 |
+| `ab_visibility` / `ab_viewport` | 显示/隐藏浏览器窗口（想"围观"AI 操作时 set(true)）/ 读取、设置、重置视口尺寸 |
 | `ab_claim_tab` | 认领一个已开的用户标签页（标题/网址三重匹配，防认错） |
 | `ab_cdp` / `ab_download_open` | 原样 CDP（白名单+确认门）/ 打开下载文件（确认门） |
 | `ab_confirm` | 批准一次待确认动作（5 分钟一次性令牌） |
@@ -122,12 +125,16 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 ## 测试
 
 ```bash
-npm test          # 55 个单元测试
+npm test          # 65 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
 npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听，逐项给修复建议
 npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome）
 npm run check     # 全部语法检查
 ```
+
+## 现成配方
+
+`browser_eval` 直接抄的任务级代码（YouTube 字幕导出等）：见 [docs/recipes.md](docs/recipes.md)。
 
 ## License
 

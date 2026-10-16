@@ -26,6 +26,9 @@ function defaultHandler(method, params, respond, fail) {
     case 'tab_get_js_dialog': case 'tab_handle_js_dialog': case 'download_config_specs':
       respond({});
       return;
+    case 'browser_viewport_get':
+      respond({ viewport: null }); // 无状态默认；set→get 一致性由测试用自定义 handlers 闭包模拟
+      return;
     case 'tab_create':
       respond({ tabId: nextMockTabId++, url: params.url ?? 'about:blank' });
       return;
@@ -40,6 +43,9 @@ function defaultHandler(method, params, respond, fail) {
       return;
     case 'tab_screenshot':
       respond({ dataBase64: 'bW9jay1zY3JlZW5zaG90' }); // 'mock-screenshot'
+      return;
+    case 'element_screenshot':
+      respond({ dataBase64: 'bW9jay1lbGVtZW50' }); // 'mock-element'（真实 PNG 由测试覆盖）
       return;
     case 'tab_ax_get_state':
       respond({ ax: JSON.stringify({ role: 'root', children: [] }) });

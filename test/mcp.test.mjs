@@ -18,10 +18,13 @@ import { buildMcpServer } from '../service/mcp.mjs';
 // 1x1 真 PNG（base64 以 iVBOR 开头），覆盖 mock 默认的假截图应答
 const REAL_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PzWvWQAAAABJRU5ErkJggg==';
+// 另一个 1x1 真 PNG（透明），用于区分元素级截图与整页截图的应答
+const ELEMENT_PNG_B64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 
 const ALL_TOOLS = [
-  'ab_list_browsers', 'ab_status', 'ab_visibility', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
-  'ab_screenshot', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open',
+  'ab_list_browsers', 'ab_status', 'ab_visibility', 'ab_viewport', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
+  'ab_screenshot', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open', 'ab_read_urls',
   'ab_confirm', 'ab_webmcp', 'browser_eval',
 ];
 
@@ -407,5 +410,102 @@ test('ab_visibility：get/set 走到浏览器连接', async () => {
     const r2 = await s.callJson('ab_visibility', { action: 'set', visible: true });
     assert.equal(r2.ok, true);
     assert.ok(s.mock.calls.some((c) => c.method === 'browser_visibility_set' && c.params.visible === true), '命令应到达扩展');
+  } finally { await s.close(); }
+});
+
+test('ab_viewport：get/set/reset 直连浏览器连接（同 ab_visibility 模式）', async () => {
+  let vp = null; // 闭包状态：set 写入 / get 读出 / reset 清空（真实现位于扩展）
+  const s = await startMcpStack({
+    handlers: {
+      browser_viewport_get: () => ({ viewport: vp }),
+      browser_viewport_set: (p) => { vp = { width: p.width, height: p.height }; return {}; },
+      browser_viewport_reset: () => { vp = null; return {}; },
+    },
+  });
+  try {
+    const g0 = await s.callJson('ab_viewport', { action: 'get' });
+    assert.deepEqual(g0.viewport, null, '初始无覆盖');
+    const set = await s.callJson('ab_viewport', { action: 'set', width: 800, height: 600 });
+    assert.equal(set.ok, true);
+    assert.deepEqual(set.viewport, { width: 800, height: 600 });
+    assert.ok(s.mock.calls.some((c) => c.method === 'browser_viewport_set' && c.params.width === 800 && c.params.height === 600),
+      '命令应到达扩展');
+    const g1 = await s.callJson('ab_viewport', { action: 'get' });
+    assert.deepEqual(g1.viewport, { width: 800, height: 600 }, 'set 后 get 一致');
+    const rs = await s.callJson('ab_viewport', { action: 'reset' });
+    assert.equal(rs.ok, true);
+    const g2 = await s.callJson('ab_viewport', { action: 'get' });
+    assert.deepEqual(g2.viewport, null, 'reset 后恢复无覆盖');
+  } finally { await s.close(); }
+});
+
+test('ab_screenshot selector：元素级截图走 element_screenshot，selector 原样到达扩展', async () => {
+  const s = await startMcpStack({
+    handlers: {
+      tab_screenshot: () => ({ dataBase64: REAL_PNG_B64 }),
+      element_screenshot: () => ({ dataBase64: ELEMENT_PNG_B64 }),
+    },
+  });
+  try {
+    const { tabId } = await s.callJson('ab_new_tab', {});
+    const shot = await s.call('ab_screenshot', { tabId, selector: { kind: 'css', value: '#out' } });
+    const img = shot.content.find((c) => c.type === 'image');
+    assert.equal(img.mimeType, 'image/png');
+    assert.equal(img.data, ELEMENT_PNG_B64);
+    const call = s.mock.calls.find((c) => c.method === 'element_screenshot');
+    assert.ok(call, 'element_screenshot 命令应到达扩展');
+    assert.equal(call.params.tabId, tabId);
+    assert.deepEqual(call.params.selector, { kind: 'css', value: '#out' });
+    assert.ok(!s.mock.calls.some((c) => c.method === 'tab_screenshot'), '元素级不应再走整页截图');
+    // 不给 selector 仍走整页 tab_screenshot
+    const full = await s.call('ab_screenshot', { tabId });
+    assert.equal(full.content.find((c) => c.type === 'image').data, REAL_PNG_B64);
+  } finally { await s.close(); }
+});
+
+test('ab_read_urls：三个 URL 走完 开→读→关 全流程；被 policy 拦的 URL 返回 blocked 且一个命令都不发', async () => {
+  const tabUrl = new Map(); // tabId -> url（navigate 时记录；eval 应答据此生成正文）
+  const s = await startMcpStack({
+    handlers: {
+      navigate_tab_url: (p) => { tabUrl.set(p.tabId, p.url); return {}; },
+      tab_eval: (p) => ({ value: { title: `Title of ${tabUrl.get(p.tabId)}`, text: `body-text of ${tabUrl.get(p.tabId)}` } }),
+    },
+  });
+  try {
+    const r = await s.callJson('ab_read_urls', {
+      urls: ['https://a.example/', 'chrome://settings/passwords', 'https://b.example/', 'https://c.example/'],
+    });
+    assert.equal(r.pages.length, 4, '结果与入参同序同长');
+    const [a, blocked, b, c] = r.pages;
+    assert.equal(a.url, 'https://a.example/');
+    assert.equal(a.title, 'Title of https://a.example/');
+    assert.match(a.text, /body-text of https:\/\/a\.example\//);
+    assert.equal(blocked.url, 'chrome://settings/passwords');
+    assert.equal(blocked.blocked, true);
+    assert.match(blocked.reason, /blocked by policy/);
+    assert.equal(b.title, 'Title of https://b.example/');
+    assert.equal(c.title, 'Title of https://c.example/');
+    // 开→读→关 各恰好 3 次（被拦 URL 不产生任何命令）
+    for (const m of ['tab_create', 'navigate_tab_url', 'tab_eval', 'tab_close']) {
+      assert.equal(s.mock.calls.filter((x) => x.method === m).length, 3, `${m} 应恰好 3 次`);
+    }
+    assert.ok(!s.mock.calls.some((x) => x.method === 'navigate_tab_url' && (x.params.url || '').startsWith('chrome://')),
+      '被拦 URL 不应出门');
+    // 后台标签：tab_create 必带 background:true（不干扰用户当前屏幕）
+    assert.ok(s.mock.calls.filter((x) => x.method === 'tab_create').every((x) => x.params.background === true));
+  } finally { await s.close(); }
+});
+
+test('ab_read_urls：maxChars 截断正文并标记 truncated；不给则默认 20000 不截断', async () => {
+  const s = await startMcpStack({
+    handlers: { tab_eval: () => ({ value: { title: 'T', text: 'x'.repeat(500) } }) },
+  });
+  try {
+    const r = await s.callJson('ab_read_urls', { urls: ['https://long.example/'], maxChars: 50 });
+    assert.equal(r.pages[0].text.length, 50);
+    assert.equal(r.pages[0].truncated, true);
+    const r2 = await s.callJson('ab_read_urls', { urls: ['https://long.example/'] });
+    assert.equal(r2.pages[0].text.length, 500);
+    assert.equal(r2.pages[0].truncated, undefined);
   } finally { await s.close(); }
 });

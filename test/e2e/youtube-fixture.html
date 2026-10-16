@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>AB-E2E YouTube 字幕夹具</title></head>
+<body>
+  <h1>youtube caption fixture（仿真视频页）</h1>
+  <!--
+    内嵌仿真 ytInitialPlayerResponse：captionTracks[0] 的 baseUrl 指向本地路由 /captions.json3
+    （由 run-e2e.mjs 的 http 服务返回编造的 json3 样例）。docs/recipes.md 的提取代码
+    在本页与真实视频页上行为一致；真实 YouTube 不做网络验证（recipes.md 已注明）。
+  -->
+  <script>
+    window.ytInitialPlayerResponse = {
+      videoDetails: { title: 'fixture video', author: 'e2e' },
+      captions: {
+        playerCaptionsTracklistRenderer: {
+          captionTracks: [
+            { baseUrl: '/captions.json3?v=fixture&lang=zh-Hans', languageCode: 'zh-Hans', kind: 'asr' },
+            { baseUrl: '/captions.json3?v=fixture&lang=en', languageCode: 'en' },
+          ],
+        },
+      },
+    };
+  </script>
+</body>
+</html>

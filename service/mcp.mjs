@@ -4,7 +4,8 @@
 // 便于测试注入 InMemoryTransport；入口见 service/mcp-entry.mjs）。
 //
 // 两层工具面（对照规格书 §13 路线图第 3 条「粗粒度工具 + REPL 双层」）：
-//   - ab_* 粗粒度工具：开标签/导航/截图/无障碍树/认领/CDP/下载确认，全部过策略门；
+//   - ab_* 粗粒度工具：开标签/导航/截图（整页/元素）/无障碍树/认领/CDP/下载确认/
+//     批量读页/视口，全部过策略门；
 //   - browser_eval：REPL 型工具，node:vm 沙箱内执行 JS，注入 `agent`（createAgentApi
 //     的返回对象，即可写 `const t = await (await agent.browsers.getDefault()).tabs.new()`）
 //     与 `nodeRepl.write(x)`（收集输出）；不注入 require；console.* 一并收集。
@@ -22,6 +23,7 @@ import vm from 'node:vm';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CDP_ALLOWLIST } from '../shared/protocol.mjs';
+import { Locator } from './locator.mjs';
 
 const EVAL_TIMEOUT_MS = 30_000;
 
@@ -66,11 +68,11 @@ function fmtValue(v) {
 }
 
 /**
- * 构建 MCP 服务器（13 个工具）。
+ * 构建 MCP 服务器（17 个工具）。
  * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null}} opts
  *   api         —— createAgentApi 的返回值（必填）
  *   policy      —— service/policy.mjs 的 Policy 实例（缺省时跳过工具层策略，api 层仍可能拦）
- *   connections —— 取活连接的方式（ab_download_open 需要直连 connection.cmd）
+ *   connections —— 取活连接的方式（ab_download_open / ab_viewport 需要直连 connection.cmd）
  */
 export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null } = {}) {
   if (!api || typeof api.browsers?.getDefault !== 'function') {
@@ -80,7 +82,7 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
   //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
   const server = new McpServer(
-    { name: 'chrome-agent-browser', version: '0.2.1' },
+    { name: 'chrome-agent-browser', version: '0.3.0' },
     { capabilities: { logging: {} } },
   );
 
@@ -192,6 +194,29 @@ export function buildMcpServer({ api, policy = null, connections = null, service
     return textResult({ ok: true, visible });
   }));
 
+  // ---- 0c. ab_viewport（视口覆盖：get/set/reset，直连模式同 ab_visibility）----
+  server.registerTool('ab_viewport', {
+    title: '读取/设置视口尺寸',
+    description: '读取或覆盖浏览器视口尺寸（对所有 agent 操控的标签页生效，之后新 attach 的页面同样应用）。action: get 返回 {viewport:{width,height}|null}（null=无覆盖）；action: set 需 width/height（像素，1..10000）；action: reset 清除覆盖恢复默认。',
+    inputSchema: {
+      action: z.enum(['get', 'set', 'reset']).describe('get=查询当前视口覆盖；set=设置；reset=清除覆盖'),
+      width: z.number().int().positive().optional().describe('action=set 时必填：宽（像素）'),
+      height: z.number().int().positive().optional().describe('action=set 时必填：高（像素）'),
+    },
+  }, guard(async ({ action, width, height }) => {
+    if (action === 'get') {
+      const r = await connFor().cmd('browser_viewport_get', {});
+      return textResult({ viewport: r.viewport ?? null });
+    }
+    if (action === 'reset') {
+      await connFor().cmd('browser_viewport_reset', {});
+      return textResult({ ok: true, reset: true });
+    }
+    if (width === undefined || height === undefined) throw new Error('action=set 需要 width 与 height（正整数像素）');
+    await connFor().cmd('browser_viewport_set', { width, height });
+    return textResult({ ok: true, viewport: { width, height } });
+  }));
+
   // ---- 1. ab_list_browsers ----
   server.registerTool('ab_list_browsers', {
     title: '列出浏览器',
@@ -262,17 +287,35 @@ export function buildMcpServer({ api, policy = null, connections = null, service
     return textResult({ ok: true, tabId, url, ...(hint ? { webmcpHint: hint } : {}) });
   }));
 
-  // ---- 6. ab_screenshot ----
+  // ---- 6. ab_screenshot（整页可视区；给 selector 则元素级） ----
+  const zSelector = z.object({
+    kind: z.enum(['css', 'role', 'text', 'label', 'testid', 'placeholder']).describe('定位方式（与 browser_eval 里 tab.playwright 的定位器同构）'),
+    value: z.string().min(1).describe('定位值：css 选择器 / 角色 / 文本 / 标签 / data-testid / placeholder'),
+    name: z.string().optional().describe('kind=role 时的可访问名过滤'),
+    exact: z.boolean().optional().describe('文本是否全等匹配（默认包含）'),
+  });
   server.registerTool('ab_screenshot', {
     title: '截图',
-    description: '截取标签页可视区截图，返回 MCP image content（base64）+ 一行文本摘要。format: png（默认）| jpeg。',
+    description: '截取标签页可视区截图，返回 MCP image content（base64）+ 一行文本摘要。format: png（默认）| jpeg。给 selector 则做元素级截图（滚动到元素后按其矩形裁剪，PNG；找不到元素报错）。',
     inputSchema: {
       tabId: z.number().int(),
-      format: z.enum(['png', 'jpeg']).optional().describe('默认 png'),
+      format: z.enum(['png', 'jpeg']).optional().describe('默认 png（元素级截图固定 png）'),
+      selector: zSelector.optional().describe('元素级截图的定位器描述对象，如 {kind:"css", value:"#out"}；缺省=整个可视区'),
     },
-  }, guard(async ({ tabId, format }) => {
-    const fmt = format === 'jpeg' ? 'jpeg' : 'png';
+  }, guard(async ({ tabId, format, selector }) => {
     const { tab } = await resolveTab(tabId);
+    if (selector !== undefined) {
+      if (format === 'jpeg') throw new Error('元素级截图只支持 png（不要传 format=jpeg）');
+      const bytes = await new Locator(tab, selector).screenshot(); // Buffer
+      const data = bytes.toString('base64');
+      return {
+        content: [
+          { type: 'text', text: `screenshot: tabId=${tabId} element selector=${JSON.stringify(selector)} bytes=${bytes.length}` },
+          { type: 'image', data, mimeType: 'image/png' },
+        ],
+      };
+    }
+    const fmt = format === 'jpeg' ? 'jpeg' : 'png';
     const bytes = await tab.screenshot({ format: fmt }); // Uint8Array（规格 §9；api 层已解码）
     const data = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
     return {
@@ -408,6 +451,21 @@ export function buildMcpServer({ api, policy = null, connections = null, service
       }
       throw err; // guard 统一转结构化错误（含 -32011 不支持等）
     }
+  }));
+
+  // ---- 11c. ab_read_urls（批量隐形阅读） ----
+  server.registerTool('ab_read_urls', {
+    title: '批量隐形读页',
+    description: '批量隐形读页：后台开临时标签读完即关，不干扰用户当前屏幕。逐个 URL 过策略门（被拦的记 {url,blocked:true,reason}）→ 后台标签加载 → 读 title 与正文（innerText，截断 maxChars，默认 20000 字符）→ 关标签。返回 {pages:[...]}，与入参同序；单个失败不影响其余（记 {url,error}）。',
+    inputSchema: {
+      urls: z.array(z.string().min(1)).min(1).max(10).describe('要读的 URL 列表（1 到 10 个）'),
+      maxChars: z.number().int().positive().optional().describe('每页正文截断长度，默认 20000 字符'),
+      browserId: z.string().optional().describe('目标浏览器 id（ab_list_browsers 的 id，如 Arc；缺省=默认浏览器）'),
+    },
+  }, guard(async ({ urls, maxChars, browserId }) => {
+    const browser = pickBrowser(browserId);
+    const pages = await browser.tabs.content(maxChars !== undefined ? { urls, maxChars } : { urls });
+    return textResult({ pages });
   }));
 
   // ---- 12. browser_eval（REPL，本项目核心特色） ----

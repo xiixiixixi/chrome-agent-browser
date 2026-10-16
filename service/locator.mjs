@@ -46,6 +46,15 @@ export class Locator {
   async textContent() { return this._action('textContent'); }
   async allTextContents() { return this._action('allTextContents'); }
 
+  /** 元素级截图（PNG Buffer）：扩展侧 scrollIntoView 后按元素矩形 clip 截取。 */
+  async screenshot() {
+    const r = await this.tab._locator('element_screenshot', this.selector);
+    if (!r || typeof r.dataBase64 !== 'string') {
+      throw new Error('element_screenshot: no image data');
+    }
+    return Buffer.from(r.dataBase64, 'base64');
+  }
+
   async _action(action, value) {
     const params = value === undefined ? { action } : { action, value };
     const r = await this.tab._locator('locator_action', this.selector, params);

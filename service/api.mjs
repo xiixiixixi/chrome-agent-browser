@@ -3,6 +3,7 @@
 // createAgentApi(getConnections, {policy}) → { browsers }
 //   browsers.list()/get(id)/getDefault()
 //   browser.{browserId, family, tabs, user, history, nameSession, capabilities}
+//   browser.tabs.content({urls, maxChars})：批量隐形阅读（后台开标签读完即关）
 //   tab.{id, goto, back, forward, reload, close, url, title, screenshot, eval,
 //        ax, playwright, capabilities, markDeliverable, markHandoff, dev}
 //
@@ -357,6 +358,43 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
           const rows = Array.isArray(r) ? r : (r.tabs ?? []);
           const sel = rows.find((row) => row && (row.selected === true || row.active === true) && row.tabId !== undefined);
           return sel ? makeTab(sel.tabId, sel) : null;
+        },
+        /**
+         * 批量隐形阅读：逐个 URL「过策略门 → 后台开临时标签 → 等加载完成 → 读
+         * title/body.innerText（截断 maxChars，默认 20000）→ 关标签」。
+         * 被策略拦截的 URL 记 {url, blocked:true, reason}；单个 URL 失败不影响其余，
+         * 记 {url, error}。返回与入参同序的结果数组。
+         */
+        async content({ urls, maxChars = 20000 } = {}) {
+          if (!Array.isArray(urls) || urls.length === 0
+            || !urls.every((u) => typeof u === 'string' && u.length > 0)) {
+            throw new TypeError('content() requires a non-empty array of url strings');
+          }
+          const limit = Number.isInteger(maxChars) && maxChars > 0 ? maxChars : 20000;
+          const pages = [];
+          for (const url of urls) {
+            const v = policy ? policy.check({ kind: 'navigate', url }) : { allowed: true };
+            if (!v.allowed) {
+              pages.push({ url, blocked: true, reason: v.reason, code: v.code ?? 'POLICY_BLOCKED' });
+              continue;
+            }
+            let t = null;
+            try {
+              t = await this.new({ background: true }); // 后台临时标签，不抢用户当前屏幕
+              await t.goto(url);                         // navigate_tab_url 在扩展侧等加载完成
+              const r = await t.eval('({ title: document.title, text: document.body ? document.body.innerText : "" })');
+              const title = r && typeof r.title === 'string' ? r.title : '';
+              const text = r && typeof r.text === 'string' ? r.text : '';
+              pages.push(text.length > limit
+                ? { url, title, text: text.slice(0, limit), truncated: true }
+                : { url, title, text });
+            } catch (err) {
+              pages.push({ url, error: String((err && err.message) || err) });
+            } finally {
+              if (t) { try { await t.close(); } catch { /* 已关闭则忽略 */ } }
+            }
+          }
+          return pages;
         },
       },
       user: {
