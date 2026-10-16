@@ -178,6 +178,29 @@ export function createAudit(opts = {}) {
     },
 
     /**
+     * ab_login 留痕（v0.3.2）：一条 ab_login（origin + filled 字段名列表——只有字段名，
+     * 绝无凭据值；凭据本身的 fill 走 locator_action，那里 value 已记 [redacted]）。
+     * suspicious 时追加一条 login_suspicious（from/to 只记 origin，不记带参完整 URL）。
+     */
+    recordLogin({ tabId, origin, filled, submitted, suspicious, landedOrigin }) {
+      if (audit.disabled) return;
+      const entry = { ts: new Date().toISOString(), cmd: 'ab_login' };
+      if (Number.isInteger(tabId)) entry.tabId = tabId;
+      entry.paramsLite = {
+        origin: truncStr(origin ?? '', 300),
+        filled: Array.isArray(filled) ? filled.filter((f) => typeof f === 'string') : [],
+        submitted: submitted === true,
+      };
+      audit._appendLine(JSON.stringify(entry));
+      if (suspicious === true) {
+        const sus = { ts: new Date().toISOString(), cmd: 'login_suspicious' };
+        if (Number.isInteger(tabId)) sus.tabId = tabId;
+        sus.paramsLite = { from: truncStr(origin ?? '', 300), to: truncStr(landedOrigin ?? '', 300) };
+        audit._appendLine(JSON.stringify(sus));
+      }
+    },
+
+    /**
      * 查询流水（倒序，最新在前）。
      * @returns {{total:number, entries:object[]}|{disabled:true}}
      */

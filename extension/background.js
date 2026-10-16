@@ -1083,6 +1083,84 @@ async function cmdLocatorSnapshot(p) {
   return { html };
 }
 
+// ---- 登录表单探测（ab_login 的第一步；只读，值不经过本命令）----
+//
+// 页面内一次 Runtime.evaluate 完成：找可见 input[type=password]（第一个）→
+// scope 取其所属 form（无 form 退整文档）→ 同 scope 的用户名候选（优先
+// autocomplete=username，其次 name/id/placeholder 语义，再次密码框之前最近的
+// text/email/tel）→ 提交按钮 → one-time-code 框（或同表单第二个密码风格框）。
+// 每个字段生成 {kind:'css', value} 定位器描述（#id 唯一优先 → name/autocomplete
+// 属性唯一 → nth-of-type 路径），service 端用它走 locator_action fill/click。
+
+const LOGIN_DETECT_EXPR = '(function(){try{'
+  + 'function vis(el){return !!(el.offsetParent||el.getClientRects().length);}'
+  + 'function uniq(sel){try{return document.querySelectorAll(sel).length===1;}catch(e){return false;}}'
+  + 'var SAFE_ID=/^[A-Za-z][A-Za-z0-9_-]*$/;var SAFE_ATTR=/^[\w.-]+$/;'
+  + 'function cssFor(el){'
+  + '  var t=el.tagName.toLowerCase();'
+  + '  var id=el.getAttribute("id");'
+  + '  if(id&&SAFE_ID.test(id)&&uniq("#"+id)){return "#"+id;}'
+  + '  var nm=el.getAttribute("name");'
+  + '  if(nm&&SAFE_ATTR.test(nm)&&uniq(t+\'[name="\'+nm+\'"]\')){return t+\'[name="\'+nm+\'"]\';}'
+  + '  var ac=el.getAttribute("autocomplete");'
+  + '  if(ac&&SAFE_ATTR.test(ac)&&uniq(t+\'[autocomplete="\'+ac+\'"]\')){return t+\'[autocomplete="\'+ac+\'"]\';}'
+  + '  var parts=[];var cur=el;var guard=0;'
+  + '  while(cur&&cur.nodeType===1&&guard++<25){'
+  + '    var tag=cur.tagName.toLowerCase();'
+  + '    if(tag==="html"){parts.unshift("html");break;}'
+  + '    var idx=1;var sib=cur;'
+  + '    while((sib=sib.previousElementSibling)){if(sib.tagName===cur.tagName){idx++;}}'
+  + '    parts.unshift(tag+":nth-of-type("+idx+")");'
+  + '    cur=cur.parentNode;'
+  + '    if(cur&&cur.nodeType===1){var pid=cur.getAttribute&&cur.getAttribute("id");'
+  + '      if(pid&&SAFE_ID.test(pid)&&uniq("#"+pid)){parts.unshift("#"+pid);break;}}'
+  + '  }'
+  + '  return parts.join(">");'
+  + '}'
+  + 'var pws=[].slice.call(document.querySelectorAll("input[type=password]")).filter(vis);'
+  + 'if(!pws.length){return {found:false,reason:"no visible password input"};}'
+  + 'var pw=pws[0];'
+  + 'var scope=(pw.form&&pw.form.querySelector)?pw.form:document;'
+  + 'function textInputs(root){return [].slice.call(root.querySelectorAll("input")).filter(function(el){'
+  + '  if(el===pw||el.type==="password"||!vis(el)){return false;}'
+  + '  var t=(el.getAttribute("type")||"text").toLowerCase();'
+  + '  return t==="text"||t==="email"||t==="tel";'
+  + '});}'
+  + 'var users=textInputs(scope);'
+  + 'var u=users.find(function(a){return /username/i.test(a.getAttribute("autocomplete")||"");})'
+  + '  ||users.find(function(a){return /(user|email|account|login|mail)/i.test((a.getAttribute("name")||"")+" "+(a.getAttribute("id")||"")+" "+(a.getAttribute("placeholder")||""));})'
+  + '  ||users.filter(function(a){return !!(a.compareDocumentPosition(pw)&Node.DOCUMENT_POSITION_FOLLOWING);}).pop()'
+  + '  ||users[0]||null;'
+  + 'var btn=null;'
+  + 'if(scope!==document){btn=scope.querySelector(\'button[type=submit],input[type=submit],button:not([type]),input[type=image]\');}'
+  + 'if(btn&&!vis(btn)){btn=null;}'
+  + 'if(!btn){'
+  + '  var btns=[].slice.call(document.querySelectorAll(\'button,[role=button],input[type=submit],input[type=image]\')).filter(vis);'
+  + '  btn=btns.find(function(b){return /(log\\s?in|sign\\s?in|continue|submit|登录|登陆|log\\s?on)/i.test((b.innerText||"")+" "+(b.value||"")+" "+(b.getAttribute("aria-label")||""));})||null;'
+  + '}'
+  + 'var otps=[].slice.call(scope.querySelectorAll(\'input[autocomplete="one-time-code"]\')).filter(vis);'
+  + 'var otp=otps[0]||null;'
+  + 'if(!otp&&pws.length>1&&pw.form&&pws[1].form===pw.form){otp=pws[1];}'
+  + 'return {found:true,'
+  + '  username:u?{kind:"css",value:cssFor(u)}:null,'
+  + '  password:{kind:"css",value:cssFor(pw)},'
+  + '  submit:btn?{kind:"css",value:cssFor(btn)}:null,'
+  + '  totp:otp&&otp!==pw?{kind:"css",value:cssFor(otp)}:null};'
+  + '}catch(e){return {found:false,reason:String(e&&e.message||e)};}})()';
+
+async function cmdLoginDetect(p) {
+  await ensureAttached(p.tabId);
+  const r = await cdpSend(p.tabId, 'Runtime.evaluate', { expression: LOGIN_DETECT_EXPR, returnByValue: true });
+  if (r && r.exceptionDetails) {
+    throw abErr(ERR.INTERNAL, 'login_detect threw: ' + (r.exceptionDetails.text || ''));
+  }
+  const out = r && r.result && r.result.value;
+  if (!out || typeof out !== 'object' || typeof out.found !== 'boolean') {
+    return { found: false, reason: 'login_detect: no result' };
+  }
+  return out;
+}
+
 // ---- CDP 直通 ----
 
 async function cmdTabCdpCall(p) {
@@ -1308,6 +1386,7 @@ const REGISTRY = {
   locator_action: { spec: { tabId: 'number', selector: 'object', action: 'string', value: 'string?' }, fn: cmdLocatorAction },
   locator_snapshot: { spec: { tabId: 'number' }, fn: cmdLocatorSnapshot },
   element_screenshot: { spec: { tabId: 'number', selector: 'object' }, fn: cmdElementScreenshot },
+  login_detect: { spec: { tabId: 'number' }, fn: cmdLoginDetect },
 
   tab_cdp_call: { spec: { tabId: 'number', method: 'string', params: 'object?' }, fn: cmdTabCdpCall },
   tab_cdp_events: { spec: { tabId: 'number', afterSequence: 'number?', limit: 'number?' }, fn: cmdTabCdpEvents },

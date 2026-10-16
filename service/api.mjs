@@ -303,6 +303,7 @@ export function createAgentApi(getConnections, { policy = null } = {}) {
         markHandoff: () => call('tab_mark', { tabId, status: 'handoff' }),
         dev: { logs: async () => (await call('tab_dev_logs', { tabId })).logs ?? [] },
         _locator: async (method, selector, extra) => call(method, { tabId, selector, ...extra }),
+        _cmd: (method, params) => call(method, params), // 通用命令通道（login_detect 等直发命令）
       };
       tab.ax.write = tab.ax.get; // write = 同 get（子集约定）
       tab.playwright = createPlaywright(tab);

@@ -5,7 +5,7 @@
 //
 // 两层工具面（对照规格书 §13 路线图第 3 条「粗粒度工具 + REPL 双层」）：
 //   - ab_* 粗粒度工具：开标签/导航/截图（整页/元素）/无障碍树/认领/CDP/下载确认/
-//     批量读页/视口，全部过策略门；
+//     批量读页/视口/凭据仓（ab_login 凭据只在本机流转，不进模型），全部过策略门；
 //   - browser_eval：REPL 型工具，node:vm 沙箱内执行 JS，注入 `agent`（createAgentApi
 //     的返回对象，即可写 `const t = await (await agent.browsers.getDefault()).tabs.new()`）
 //     与 `nodeRepl.write(x)`（收集输出）；不注入 require；console.* 一并收集。
@@ -24,6 +24,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CDP_ALLOWLIST } from '../shared/protocol.mjs';
 import { Locator } from './locator.mjs';
+import { createLogin } from './login.mjs';
 
 const EVAL_TIMEOUT_MS = 30_000;
 
@@ -68,14 +69,15 @@ function fmtValue(v) {
 }
 
 /**
- * 构建 MCP 服务器（18 个工具）。
- * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null, audit?: object|null}} opts
+ * 构建 MCP 服务器（20 个工具）。
+ * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null, audit?: object|null, credentials?: object|null}} opts
  *   api         —— createAgentApi 的返回值（必填）
  *   policy      —— service/policy.mjs 的 Policy 实例（缺省时跳过工具层策略，api 层仍可能拦）
  *   connections —— 取活连接的方式（ab_download_open / ab_viewport 需要直连 connection.cmd）
  *   audit       —— service/audit.mjs 的审计实例（ab_audit 查询用；缺省时该工具报未装配）
+ *   credentials —— service/credentials.mjs 的凭据仓句柄（ab_login/ab_credentials 用；缺省时报不支持）
  */
-export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null, audit = null } = {}) {
+export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null, audit = null, credentials = null } = {}) {
   if (!api || typeof api.browsers?.getDefault !== 'function') {
     throw new TypeError('buildMcpServer requires { api } — createAgentApi() 的返回对象');
   }
@@ -83,9 +85,10 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
   //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
   const server = new McpServer(
-    { name: 'chrome-agent-browser', version: '0.3.1' },
+    { name: 'chrome-agent-browser', version: '0.3.2' },
     { capabilities: { logging: {} } },
   );
+  const loginFlow = createLogin({ credentials, audit }); // ab_login 流程（credentials 为 null 时由工具层先拦）
 
   // tabId → { browser, tab }：new/claim 时登记；未知 tabId 跨浏览器探测后缓存
   const tabRegistry = new Map();
@@ -488,6 +491,33 @@ export function buildMcpServer({ api, policy = null, connections = null, service
       throw new Error(`since 需为合法 ISO 时间字符串，收到: ${since}`);
     }
     return textResult(audit.query({ limit, last, cmd, tabId, since }));
+  }));
+
+  // ---- 11e. ab_login（全自动登录：凭据只在本机流转，绝不进模型上下文） ----
+  server.registerTool('ab_login', {
+    title: '自动登录',
+    description: '对指定标签页全自动登录：从本机 macOS 钥匙串取出该站点凭据（页面 origin 必须与存储 origin 一致，仅容忍 www. 前缀差异），探测登录表单并填写用户名/密码/TOTP 后提交。入参只有 tabId——凭据由本地服务取出直发页面，绝不进入对话、日志或审计。提交后 3 秒内若跳到完全不同的域，结果标 suspicious:true（不拦截，如实报告供人工复核）。未存过凭据时返回一条设置指引（npm run credential -- set <origin>）。返回 {ok, origin, filled, submitted, suspicious?}。',
+    inputSchema: {
+      tabId: z.number().int().describe('标签页 id（ab_new_tab/ab_claim_tab 返回）'),
+    },
+  }, guard(async ({ tabId }) => {
+    if (!credentials || credentials.supported !== true) {
+      return textResult({ ok: false, reason: 'unsupported-platform', guidance: '当前仅支持 macOS 钥匙串（凭据仓依赖本机 security 命令）' });
+    }
+    const { browser, tab } = await resolveTab(tabId);
+    return textResult(await loginFlow.login({ browser, tab, tabId }));
+  }));
+
+  // ---- 11f. ab_credentials（已存凭据站点清单；只列 origin，零秘密） ----
+  server.registerTool('ab_credentials', {
+    title: '已存凭据站点清单',
+    description: '列出本机钥匙串里已存登录凭据的站点 origin 清单（只列 origin，不显示任何秘密）。存入/删除走本机命令：npm run credential -- set <origin> / remove <origin>。返回 {origins:[...]}。',
+    inputSchema: {},
+  }, guard(async () => {
+    if (!credentials || credentials.supported !== true) {
+      return textResult({ origins: [], reason: '当前仅支持 macOS 钥匙串' });
+    }
+    return textResult({ origins: await credentials.list() });
   }));
 
   // ---- 12. browser_eval（REPL，本项目核心特色） ----

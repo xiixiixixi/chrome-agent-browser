@@ -30,6 +30,7 @@ import { RemoteFrontend } from './remote-frontend.mjs';
 import { createAgentApi } from './api.mjs';
 import { loadPolicy } from './policy.mjs';
 import { createAudit } from './audit.mjs';
+import { createCredentials } from './credentials.mjs';
 import { buildMcpServer } from './mcp.mjs';
 import { parseArgs, runSelfTest } from './service.mjs';
 
@@ -95,7 +96,8 @@ export async function main(argv = process.argv.slice(2)) {
   const getConnections = () => (manager ? manager.liveConnections() : remoteFrontend.liveConnections());
   const api = createAgentApi(getConnections, { policy });
   const serviceInfo = { mode: manager ? 'service' : 'frontend', startedAt: Date.now(), port: args.port };
-  const server = buildMcpServer({ api, policy, connections: getConnections, serviceInfo, audit });
+  const credentials = createCredentials(); // 凭据仓（ab_login；非 macOS 时 supported=false，工具诚实报不支持）
+  const server = buildMcpServer({ api, policy, connections: getConnections, serviceInfo, audit, credentials });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

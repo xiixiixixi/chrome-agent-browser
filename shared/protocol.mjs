@@ -84,6 +84,11 @@ export const COMMANDS = {
   tab_cdp_call: { params: { tabId: 'number', method: 'string', params: 'object?' }, returns: { result: 'any' } },
   tab_cdp_events: { params: { tabId: 'number', afterSequence: 'number?', limit: 'number?' }, returns: { events: 'array', cursor: 'number' } },
 
+  // 登录表单探测（ab_login 用；只读，不入审计白名单）：找可见密码框 + 同表单用户名
+  // 输入框 + 提交按钮 + 可选 one-time-code 框，各返回 {kind:'css', value} 定位器描述。
+  // returns: {found:true, username?, password, submit?, totp?} | {found:false, reason}
+  login_detect: { params: { tabId: 'number' }, returns: { found: 'boolean' } },
+
   // WebMCP: tools declared by the page itself (discovered via CDP WebMCP domain)
   // returns.tools: [{name, description, inputSchema, readOnly}]
   webmcp_list_tools: { params: { tabId: 'number' }, returns: { tools: 'array' } },

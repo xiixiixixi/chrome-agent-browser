@@ -10,7 +10,7 @@
 ┌─ 5 ─ MCP 客户端（任意支持 MCP 的 AI 工具）
 │        │ MCP over stdio（JSON-RPC 2.0）           ← service/mcp-entry.mjs（入口）
 │        ▼
-├─ 4 ─ MCP 工具面  service/mcp.mjs：18 个工具（ab_* 粗粒度 + browser_eval REPL）
+├─ 4 ─ MCP 工具面  service/mcp.mjs：20 个工具（ab_* 粗粒度 + browser_eval REPL）
 │        ▼
 ├─ 3 ─ service 命令层  service/api.mjs（Agent API）+ policy.mjs（策略门）
 │        + connection.mjs（WS 服务端 / 租约镜像 / 心跳）
@@ -85,7 +85,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
   端口已占用后自动切换为「前端模式」连接既有服务，共享同一个浏览器连接；全部客户端退出后
   最后一个 service 进程退出，不留孤儿进程。
 
-## MCP 工具面（18 个）
+## MCP 工具面（20 个）
 
 | 工具 | 作用 |
 |---|---|
@@ -99,6 +99,8 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | `ab_cdp` / `ab_download_open` | 原样 CDP（白名单+确认门）/ 打开下载文件（确认门） |
 | `ab_confirm` | 批准一次待确认动作（5 分钟一次性令牌） |
 | `ab_audit` | **审计流水**：查询 AI 对浏览器的操作留痕（本地 `audit/` 目录；按命令/标签页/时间过滤，回答"我刚才动了什么/这个标签页被做过什么"） |
+| `ab_login` | **自动登录**：从本机钥匙串取该站点凭据，自动填用户名/密码/TOTP 并提交（入参只有 `tabId`——凭据不进对话/日志/审计；页面 origin 必须与存储 origin 一致才动笔，提交后跳陌生域会标 `suspicious`） |
+| `ab_credentials` | 列出已存凭据的站点清单（只列 origin，零秘密；配合 `npm run credential` 用） |
 | `ab_webmcp` | **WebMCP**：发现/调用网页自己申报的结构化工具（`action:list\|invoke`；非只读工具过确认门）。页面申报的工具会**自动提示**：`ab_tab_info`/导航返回的 `webmcpHint` 与运行中的日志推送，无提示再手动 list |
 | `browser_eval` | **核心特色**：给 agent 一段代码，内含完整 API 对象 `agent`，一次完成「看页面→操作→验证」循环 |
 
@@ -110,6 +112,19 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 - **CDP 白名单**：`shared/protocol.mjs` 的 `CDP_ALLOWLIST` 之外的调试指令，服务端直接拒绝，到不了浏览器。
 - **默认后台**：浏览器窗口默认不抢焦点，按需可见。
 
+### 全自动凭据仓（钥匙串存一次，以后登录全自动）
+
+把常用站点的登录凭据**只存进本机 macOS 钥匙串**一次，之后 AI 就能用 `ab_login` 全自动登录——凭据永远不会进入 AI 的对话内容：
+
+```bash
+npm run credential -- set https://github.com   # 交互录入：用户名回显、密码/TOTP 种子静默不回显
+npm run credential -- list                     # 只列已存站点，不显示任何秘密
+npm run credential -- remove https://github.com
+```
+
+- **密码不进模型**：`ab_login` 的入参只有 `tabId`；凭据由本地服务从钥匙串取出、直发浏览器扩展填进真实输入框、用完即弃。任何工具响应、日志、审计记录里都不含凭据明文（审计层对 fill 输入本来就记 `[redacted]`）。TOTP 动态口令由服务端本地生成（`node:crypto` 手写，零新依赖），种子同样不出本机。
+- **双锁防钓鱼**：第一锁——页面的 origin 必须与存储 origin 完全一致（仅容忍 `www.` 前缀差异）才会动笔，否则返回设置指引且一个动作不发；第二锁——提交后 3 秒内若跳到**完全不同的域**，结果标 `suspicious:true` 并写审计 `login_suspicious`（不拦截，但如实报告供人工复核）。
+
 ### browser_eval 的沙箱边界（诚实声明）
 
 `browser_eval` 在本地 Node 的隔离上下文执行代码，注入 `agent` / `nodeRepl.write` / `console`，
@@ -120,17 +135,18 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 ## 已知限制
 
 - 支持 Chromium 系浏览器：Chrome / Edge / Brave / Opera / Vivaldi / Arc（Arc 的清单路径按 Chromium 规则实现并双写候选位置，已在无 Arc 的机器上通过安装测试；Windows 侧未实测）。Safari/Firefox 不适用。
+- 凭据仓**当前仅支持 macOS 钥匙串**（非 macOS 上 `ab_login`/`ab_credentials` 明确报不支持）；登录路上的**图形验证码、设备确认**（推送/短信二次确认）无法全自动，需要人工接手。
 - Windows 分支（注册表等）已实现但未在真实 Windows 上测试过。
-- 剪贴板写入返回「不支持，请用定位器输入」（诚实报错）；`downloads.open` 需 Chrome 可选权限；嵌套 iframe 内的元素定位暂不支持。
+- 剪贴板写入返回「不支持，请用定位器输入」（诚实报错）；`downloads.open` 需 Chrome 可选权限；嵌套 iframe 内的元素定位暂不支持（`ab_login` 因此也只认主文档里的登录表单）。
 - 扩展 ID 依赖目录绝对路径：源码安装挪目录后需重跑 setup 并重新加载扩展；npm 全局安装不受影响（路径固定）。发布到 Chrome 商店后此限制彻底消失。
 
 ## 测试
 
 ```bash
-npm test          # 81 个单元测试
+npm test          # 104 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
 npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听，逐项给修复建议
-npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome）
+npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome；登录用例会短暂写入并清理本机钥匙串测试条目）
 npm run check     # 全部语法检查
 ```
 

@@ -66,6 +66,15 @@ function defaultHandler(method, params, respond, fail) {
     case 'locator_count':
       respond({ count: 1 });
       return;
+    case 'login_detect':
+      respond({
+        found: true,
+        username: { kind: 'css', value: '#user' },
+        password: { kind: 'css', value: '#pass' },
+        submit: { kind: 'css', value: 'button[type="submit"]' },
+        totp: null,
+      });
+      return;
     case 'locator_action':
       respond({ ok: true, value: null });
       return;

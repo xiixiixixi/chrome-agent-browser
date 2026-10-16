@@ -64,6 +64,21 @@ service (service/service.mjs) ——命令层 + 租约镜像 + MCP 服务器
   - `tab_info`（含 `user.getTabContext`）、`ab_new_tab`、`ab_navigate` 的返回在该 tab 有已申报工具时附 `webmcpHint:{toolNames, count}`；
   - MCP 面（若客户端支持日志通知）在收到清单变化时即时推送一行 `notifications/message`（info 级，logger=`webmcp`；同清单去重只推一次）。
 
+## 5c. 登录表单探测（`login_detect`，v0.3.2）
+
+`login_detect {tabId}` → `{found:true, username?, password, submit?, totp?}` 或 `{found:false, reason}`。
+每个字段是定位器描述对象 `{kind:'css', value}`，供后续 `locator_action` 的 fill/click。**只读命令，不入审计白名单**；凭据不经此命令传输——填写走 `locator_action`（审计层对 fill 值记 `[redacted]`）。
+
+扩展在页面内一次 Runtime.evaluate 完成：
+- 找**可见**的 `input[type=password]`（第一个）；找不到 → `{found:false, reason:'no visible password input'}`。
+- scope = 密码框所属 `<form>`（无 form 退化为整文档）。
+- `username`：同 scope 内可见 text/email/tel 输入框——优先 `autocomplete=username`，其次 name/id/placeholder 含 user/email/account/login，再次密码框之前最近的一个；没有则 null。
+- `submit`：scope 内 `button[type=submit]`/`input[type=submit]`/`button`；都没有则全页找带登录字样（登录/登陆/log in/sign in/continue/submit）的可见按钮。
+- `totp`：scope 内 `input[autocomplete="one-time-code"]`，或同表单第二个密码风格输入框（OTP 框常伪装成密码框）；没有则 null（service 端存了 TOTP 种子也会跳过并在结果注明）。
+- css 选择器生成：`#id` 唯一优先 → `name`/`autocomplete` 属性唯一 → nth-of-type 路径（锚在最近的带 id 祖先）。
+
+service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型）：origin 精确匹配（容忍 www.）→ 钥匙串取凭据（内存即用即弃）→ `login_detect` → locator fill（用户名/密码/TOTP）→ locator click 提交 → 3 秒内 tab 跳完全不同的域则结果标 `suspicious:true` 并写审计 `login_suspicious`。
+
 ## 6. 安全门（service 层强制）
 
 - 高危动作（转账/发送/删除/下载执行/CDP 危险面）由 service 的 policy 模块拦截 → `POLICY_BLOCKED`，data 里带需要的人类确认句柄。

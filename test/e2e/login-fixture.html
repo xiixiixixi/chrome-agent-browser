@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>AB-E2E 登录夹具</title></head>
+<body>
+  <h1>登录夹具页</h1>
+  <!-- 标准 username+password 登录表单：提交被拦截在本页消化（不出网、不跳转），
+       成功后 out 显示 logged-in:<用户名>；密码框有值才算登录成功（no-password 兜底）。 -->
+  <form id="login-form">
+    <label for="user">用户名</label>
+    <input id="user" name="username" type="text" autocomplete="username">
+    <label for="pass">密码</label>
+    <input id="pass" name="password" type="password" autocomplete="current-password">
+    <button type="submit" id="submit-btn">登录</button>
+  </form>
+  <div id="out" role="status"></div>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const u = document.getElementById('user').value;
+      const p = document.getElementById('pass').value;
+      document.getElementById('out').textContent = p ? `logged-in:${u}` : 'no-password';
+    });
+  </script>
+</body>
+</html>

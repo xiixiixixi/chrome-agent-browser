@@ -24,6 +24,7 @@ import { ConnectionManager } from '../../service/connection.mjs';
 import { createAgentApi } from '../../service/api.mjs';
 import { loadPolicy } from '../../service/policy.mjs';
 import { createAudit } from '../../service/audit.mjs';
+import { createCredentials } from '../../service/credentials.mjs';
 import { buildMcpServer } from '../../service/mcp.mjs';
 import { ERR } from '../../shared/protocol.mjs';
 
@@ -86,6 +87,7 @@ const api = createAgentApi(() => manager.liveConnections(), { policy });
 const pageHtml = readFileSync(join(ROOT, 'test/e2e/page.html'), 'utf8');
 const page2Html = readFileSync(join(ROOT, 'test/e2e/page2.html'), 'utf8');
 const ytFixtureHtml = readFileSync(join(ROOT, 'test/e2e/youtube-fixture.html'), 'utf8');
+const loginFixtureHtml = readFileSync(join(ROOT, 'test/e2e/login-fixture.html'), 'utf8');
 // json3 字幕样例（编造）：两条有效行 + 一条空行（验证配方的空行过滤）；
 // 真实 YouTube 不做网络验证（docs/recipes.md 已注明"真站效果请手动试"）
 const captionsJson3 = JSON.stringify({
@@ -101,11 +103,16 @@ const httpServer = createServer((req, res) => {
   if (path === '/captions.json3') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(captionsJson3); return; }
   if (path === '/page2.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(page2Html); return; }
   if (path === '/yt-fixture.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(ytFixtureHtml); return; }
+  if (path === '/login-fixture.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(loginFixtureHtml); return; }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(pageHtml);
 });
 await new Promise((r) => httpServer.listen(httpPort, '127.0.0.1', r));
 const pageUrl = `http://127.0.0.1:${httpPort}/`;
 const page2Url = `http://127.0.0.1:${httpPort}/page2.html`;
+// v0.3.2 登录 E2E：真钥匙串存假凭据（origin 含端口必须与页面一致）；finally 保证移除
+const loginUrl = `http://127.0.0.1:${httpPort}/login-fixture.html`;
+const loginOrigin = `http://127.0.0.1:${httpPort}`;
+const realCredentials = createCredentials();
 
 // ---- 4. 启动 Chromium（加载扩展） ----
 console.log(`[e2e] 启动: ${CHROME}\n        ${headed ? '(headed)' : '(headless=new)'} user-data-dir=${udd}`);
@@ -343,6 +350,58 @@ try {
         assert.ok(fr.entries.every((e) => e.cmd === 'navigate_tab_url'));
       } finally { await client.close(); await server.close(); }
     });
+    // v0.3.2 全自动凭据仓：真钥匙串（本机 macOS）+ 真扩展 + MCP ab_login 全链路。
+    // 红线：测试凭据是假账号 testuser/testpass；无论成败 finally 都从钥匙串移除。
+    await step('ab_login：真钥匙串 → 表单探测 → 填写 → 提交 → 页面 logged-in:testuser', async () => {
+      assert.equal(realCredentials.supported, true, 'E2E 需在 macOS 上跑（凭据仓依赖钥匙串）');
+      await realCredentials.set(loginOrigin, { username: 'testuser', password: 'testpass' });
+      assert.ok((await realCredentials.list()).includes(loginOrigin), '钥匙串 list 应含测试 origin');
+
+      const server = buildMcpServer({ api, policy, audit, connections: () => manager.liveConnections(), credentials: realCredentials });
+      const [ct, st] = InMemoryTransport.createLinkedPair();
+      await server.connect(st);
+      const client = new Client({ name: 'ab-e2e-login', version: '0' });
+      await client.connect(ct);
+      let loginTab = null;
+      try {
+        loginTab = await browser.tabs.new();
+        await loginTab.goto(loginUrl);
+
+        // ab_credentials：只列 origin，无任何秘密
+        const credList = await client.callTool({ name: 'ab_credentials', arguments: {} });
+        const cl = JSON.parse(credList.content.find((c) => c.type === 'text').text);
+        assert.ok(cl.origins.includes(loginOrigin));
+        assert.ok(!JSON.stringify(cl).includes('testpass'), '清单不得含密码');
+
+        // ab_login 全链路
+        const res = await client.callTool({ name: 'ab_login', arguments: { tabId: loginTab.id } });
+        assert.ok(!res.isError, JSON.stringify(res.content).slice(0, 300));
+        const raw = JSON.stringify(res);
+        assert.ok(!raw.includes('testpass'), '工具响应不得含密码');
+        assert.ok(!raw.includes('testuser'), '工具响应不得含用户名（只有字段名清单）');
+        const r = JSON.parse(res.content.find((c) => c.type === 'text').text);
+        assert.equal(r.ok, true, JSON.stringify(r));
+        assert.equal(r.origin, loginOrigin);
+        assert.deepEqual(r.filled, ['username', 'password']);
+        assert.equal(r.submitted, true);
+        assert.equal(r.suspicious, undefined, '本页提交被拦截不跳转，不该 suspicious');
+
+        // 页面真的登录成功（密码框有值才会显示 logged-in:testuser）
+        const out = await loginTab.eval('document.getElementById("out").textContent');
+        assert.equal(out, 'logged-in:testuser', `页面状态: ${out}`);
+
+        // 审计：ab_login 一条（origin+filled 字段名）；全目录无凭据明文
+        const files = readdirSync(AUDIT_DIR).filter((f) => /^audit-\d{8}\.jsonl/.test(f));
+        const text = files.flatMap((f) => readFileSync(join(AUDIT_DIR, f), 'utf8').split('\n')).filter(Boolean).join('\n');
+        assert.ok(text.includes('"cmd":"ab_login"'), '审计应含 ab_login');
+        assert.ok(!text.includes('testpass'), '审计不得含密码明文');
+        assert.ok(!text.includes('testuser'), '审计不得含用户名（fill 值一律 [redacted]）');
+      } finally {
+        if (loginTab) { try { await loginTab.close(); } catch { /* 已关 */ } }
+        await client.close();
+        await server.close();
+      }
+    });
   }
 } finally {
   // ---- 6. 清理（只删自己写的；杀整个 Chrome 进程组防僵尸） ----
@@ -361,8 +420,10 @@ try {
   if (leftover) console.log(`[e2e] 警告：清理竞态残留 ${leftover} 份清单，已终扫删除`);
   // 还原用户真实 host-config（安装器在测试中重写了端口）
   if (hostConfigBackup !== null) writeFileSync(hostConfigPath, hostConfigBackup);
+  // 钥匙串测试凭据清理（红线：不留残留；remove 幂等，未存时静默）
+  try { await realCredentials.remove(loginOrigin); } catch { /* noop */ }
   try { rmSync(AUDIT_DIR, { recursive: true, force: true }); } catch { /* noop */ }
-  console.log(`[e2e] 清理完成（浏览器/服务/测试页/临时目录/${writtenManifests.length} 份清单）`);
+  console.log(`[e2e] 清理完成（浏览器/服务/测试页/临时目录/钥匙串测试凭据/${writtenManifests.length} 份清单）`);
 }
 
 const failed = results.filter(([, e]) => e);
