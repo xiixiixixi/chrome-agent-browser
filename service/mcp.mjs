@@ -88,7 +88,7 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
   //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
   const server = new McpServer(
-    { name: 'chrome-agent-browser', version: '0.5.0' },
+    { name: 'chrome-agent-browser', version: '0.5.1' },
     { capabilities: { logging: {} } },
   );
   const loginFlow = createLogin({ credentials, audit }); // ab_login 流程（credentials 为 null 时由工具层先拦）

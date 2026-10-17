@@ -18,6 +18,16 @@
 //   type {pid?, text}                  → 键盘事件逐段输入（≤20 字符/事件，规避单事件长度限制）
 //   key {pid?, key, modifiers?}        → modifiers: cmd/ctrl/alt/shift；key 用键码映射表
 //   app-focus {pid}                    → AX raise 主窗口 + NSRunningApplication activate
+//   overlay-show {x, y, kind:'arrow'|'click', durationMs?(默认700)} → {ok:true}
+//                                       幽魂光标：在 (x,y) 闪现琥珀色 AI 专属箭头（kind=click
+//                                       追加约 350ms 扩散涟漪），durationMs 后淡出。叠加窗点击
+//                                       穿透、不抢焦点、真鼠标不动；窗口懒创建并复用。
+//   overlay-hide                       → 立即隐藏叠加 → {ok:true}
+//
+// 线程模型（v0.5.1 起）：主线程跑 NSApplication run loop（叠加窗口需要 AppKit）；
+// stdin 移到后台队列逐行读，命令解析与执行留在读取线程（与旧版单线程行为一致），
+// 仅 overlay 的窗口操作经 DispatchQueue.main.async 切主线程执行后应答；
+// stdin EOF → 主线程 NSApp.terminate 退出（保持旧行为：进程随 stdin 关闭而退出）。
 //
 // 安全边界：本助手不做任何锁屏/解锁/认证类操作；只执行调用方显式给出的动作。
 
@@ -75,7 +85,10 @@ let AX_NOT_GRANTED_HINT = "辅助功能（AX）未授权：系统设置 → 隐�
 // ---------- probe ----------
 
 func cmdProbe(_ id: Any?, _ p: [String: Any]) {
-    respondOk(id, ["axGranted": axTrusted(), "screenGranted": CGPreflightScreenCaptureAccess()])
+    var out: [String: Any] = ["axGranted": axTrusted(), "screenGranted": CGPreflightScreenCaptureAccess()]
+    let b = CGDisplayBounds(CGMainDisplayID()) // 主屏尺寸（自检把幽魂光标定位到屏幕中央用）
+    out["screen"] = ["w": b.width, "h": b.height]
+    respondOk(id, out)
 }
 
 // ---------- windows（CGWindowList：窗口清单本身无需授权；窗口标题需屏幕录制授权才可见） ----------
@@ -349,30 +362,223 @@ func cmdAppFocus(_ id: Any?, _ p: [String: Any]) {
     respondOk(id, ["axRaised": raised, "appActivated": activated])
 }
 
-// ---------- 主循环 ----------
+// ---------- 幽魂光标叠加层（overlay：AI 动手位置的可见化提示；真鼠标始终不动） ----------
 
-while let line = readLine() {
-    autoreleasepool {
-        guard let data = line.data(using: .utf8),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            respondErr(nil, "请求不是合法 JSON 对象（需要单行 {id, cmd, ...}）", code: "bad-request")
-            return
+let AMBER = NSColor(srgbRed: 245 / 255, green: 158 / 255, blue: 11 / 255, alpha: 1) // 与扩展角标同色系
+
+/** 箭头多边形（热区在 (0,0)，箭体向右下延伸；y 向下坐标，draw 时按锚点平移）。 */
+let ARROW_POINTS: [CGPoint] = [
+    CGPoint(x: 0, y: 0), CGPoint(x: 0, y: 16.9), CGPoint(x: 4.2, y: 12.7), CGPoint(x: 7.1, y: 19.6),
+    CGPoint(x: 10.3, y: 18.2), CGPoint(x: 7.4, y: 11.5), CGPoint(x: 12.2, y: 11.5),
+]
+
+/** 叠加绘制视图：kind=arrow 只画琥珀箭头；kind=click 追加约 350ms 的扩散涟漪。 */
+final class OverlayView: NSView {
+    var isClick = false
+    var ripple: CGFloat = 0 // 涟漪进度 0→1
+    let anchor = CGPoint(x: 56, y: 56) // 热区在 140x140 视图内的锚点（涟漪最大半径 52 也容纳得下）
+
+    override var isFlipped: Bool { true } // 与屏幕像素同向（y 向下），坐标换算直观
+
+    override func draw(_ dirtyRect: NSRect) {
+        // 涟漪：以热区为圆心，半径 8→52、透明度 0.85→0 扩散一圈
+        if isClick, ripple > 0 {
+            let t = min(max(ripple, 0), 1)
+            let radius = 8 + 44 * t
+            let ring = NSBezierPath(ovalIn: NSRect(x: anchor.x - radius, y: anchor.y - radius,
+                                                   width: radius * 2, height: radius * 2))
+            AMBER.withAlphaComponent(0.85 * (1 - t)).setStroke()
+            ring.lineWidth = 3 - 2 * t
+            ring.stroke()
         }
-        let id = obj["id"]
-        guard let cmd = obj["cmd"] as? String else {
-            respondErr(id, "缺少 cmd 字段", code: "bad-request")
-            return
+        // 箭头主体：多边形 × 1.15 平移到锚点（热区尖端精确落在动作坐标上）
+        let path = NSBezierPath()
+        for (i, pt) in ARROW_POINTS.enumerated() {
+            let p = NSPoint(x: anchor.x + pt.x * 1.15, y: anchor.y + pt.y * 1.15)
+            if i == 0 { path.move(to: p) } else { path.line(to: p) }
         }
-        switch cmd {
-        case "probe": cmdProbe(id, obj)
-        case "windows": cmdWindows(id, obj)
-        case "ax-tree": cmdAxTree(id, obj)
-        case "element-click": cmdElementClick(id, obj)
-        case "xy-click": cmdXyClick(id, obj)
-        case "type": cmdType(id, obj)
-        case "key": cmdKey(id, obj)
-        case "app-focus": cmdAppFocus(id, obj)
-        default: respondErr(id, "未知命令: \(cmd)", code: "unknown-cmd")
+        path.close()
+        // 柔和外发光：给填充挂一圈琥珀阴影（blur 12），再实心填充 + 白描边
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 12
+        shadow.shadowColor = AMBER.withAlphaComponent(0.55)
+        shadow.shadowOffset = .zero
+        shadow.set()
+        AMBER.setFill()
+        path.fill()
+        NSShadow().set() // 清除阴影，避免影响描边
+        NSColor.white.setStroke()
+        path.lineWidth = 1.4
+        path.stroke()
+    }
+}
+
+/**
+ * 幽魂光标控制器：懒创建一次 140x140 点击穿透面板并复用；显示 durationMs 后淡出。
+ * 仅主线程调用（命令分发处保证）。失败安全：任何异常路径只返回错误文案，不影响主命令循环。
+ */
+final class OverlayController {
+    private let panelSize: CGFloat = 140
+    private var panel: NSPanel?
+    private var view: OverlayView?
+    private var fadeItem: DispatchWorkItem?
+    private var rippleTimer: Timer?
+    private var generation = 0 // 防串台：新一次显示后，旧淡出/涟漪回调不得动新窗口
+
+    /** 显示；成功返回 nil，失败返回错误文案。 */
+    func show(x: Double, y: Double, kind: String, durationMs: Int) -> String? {
+        guard let main = NSScreen.screens.first else { return "无可用屏幕（NSScreen.screens 为空）" }
+        if panel == nil {
+            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: panelSize, height: panelSize),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 2) // 盖普通窗口，不抢系统 UI
+            p.isOpaque = false
+            p.backgroundColor = .clear
+            p.hasShadow = false
+            p.ignoresMouseEvents = true // 点击穿透
+            p.hidesOnDeactivate = false
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary] // 全屏应用上也显示
+            p.isReleasedWhenClosed = false
+            let v = OverlayView(frame: NSRect(x: 0, y: 0, width: panelSize, height: panelSize))
+            p.contentView = v
+            panel = p
+            view = v
+        }
+        guard let panel, let view else { return "叠加窗口创建失败" }
+
+        generation += 1
+        let gen = generation
+        fadeItem?.cancel()
+        rippleTimer?.invalidate()
+        rippleTimer = nil
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0
+            view.animator().alphaValue = 1 // 若正处淡出中，立即回满
+        })
+        view.isClick = (kind == "click")
+        view.ripple = 0
+        view.needsDisplay = true
+
+        // 屏幕坐标（CG 系：y 向下、原点在主屏左上）→ AppKit 窗口 frame（y 向上、原点在主屏左下）。
+        // 锚点对准 (x, y)，即箭头尖端/涟漪圆心精确落在动作坐标上。
+        let topLeftCgY = y - Double(view.anchor.y)
+        panel.setFrameOrigin(NSPoint(x: x - Double(view.anchor.x),
+                                     y: main.frame.maxY - topLeftCgY - Double(panelSize)))
+        panel.orderFrontRegardless() // 显示但绝不 activate（不抢焦点）
+
+        if view.isClick {
+            let start = Date()
+            rippleTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] timer in
+                guard let self, let v = self.view else { timer.invalidate(); return }
+                v.ripple = CGFloat(min(Date().timeIntervalSince(start) * 1000 / 350, 1))
+                v.needsDisplay = true
+                if v.ripple >= 1 {
+                    timer.invalidate()
+                    if self.rippleTimer === timer { self.rippleTimer = nil }
+                }
+            }
+        }
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == gen else { return } // panel/view 已是本函数解包后的局部常量
+            self.rippleTimer?.invalidate()
+            self.rippleTimer = nil
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.18
+                view.animator().alphaValue = 0
+            }, completionHandler: {
+                guard self.generation == gen else { return } // 已被新一次显示接管
+                panel.orderOut(nil)
+                view.alphaValue = 1
+            })
+        }
+        fadeItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(durationMs), execute: item)
+        return nil
+    }
+
+    /** 立即隐藏（自检/收尾用；幂等）。 */
+    func hide() {
+        generation += 1 // 使一切在途淡出/涟漪回调失效
+        fadeItem?.cancel()
+        fadeItem = nil
+        rippleTimer?.invalidate()
+        rippleTimer = nil
+        panel?.orderOut(nil)
+    }
+}
+
+let overlay = OverlayController()
+
+func cmdOverlayShow(_ id: Any?, _ p: [String: Any]) {
+    guard let x = (p["x"] as? NSNumber)?.doubleValue, let y = (p["y"] as? NSNumber)?.doubleValue,
+          x.isFinite, y.isFinite else {
+        respondErr(id, "overlay-show 需要 x/y（数字，屏幕坐标）", code: "bad-args")
+        return
+    }
+    let kind = p["kind"] as? String ?? "arrow"
+    guard kind == "arrow" || kind == "click" else {
+        respondErr(id, "overlay-show 的 kind 需为 arrow 或 click", code: "bad-kind")
+        return
+    }
+    var durationMs = p["durationMs"] as? Int ?? 700
+    if durationMs < 100 { durationMs = 100 }
+    if durationMs > 5000 { durationMs = 5000 }
+    DispatchQueue.main.async { // 窗口操作必须在主线程（run loop 上）
+        if let reason = overlay.show(x: x, y: y, kind: kind, durationMs: durationMs) {
+            respondErr(id, reason, code: "overlay-failed")
+        } else {
+            respondOk(id, [:])
         }
     }
 }
+
+func cmdOverlayHide(_ id: Any?) {
+    DispatchQueue.main.async {
+        overlay.hide()
+        respondOk(id, [:])
+    }
+}
+
+// ---------- 主循环（主线程跑 AppKit run loop；stdin 移后台队列逐行读） ----------
+
+/** 解析并执行一行请求；overlay 命令切主线程执行，其余在读取线程内联完成（与旧版行为一致）。 */
+func handleLine(_ line: String) {
+    guard let data = line.data(using: .utf8),
+          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        respondErr(nil, "请求不是合法 JSON 对象（需要单行 {id, cmd, ...}）", code: "bad-request")
+        return
+    }
+    let id = obj["id"]
+    guard let cmd = obj["cmd"] as? String else {
+        respondErr(id, "缺少 cmd 字段", code: "bad-request")
+        return
+    }
+    switch cmd {
+    case "probe": cmdProbe(id, obj)
+    case "windows": cmdWindows(id, obj)
+    case "ax-tree": cmdAxTree(id, obj)
+    case "element-click": cmdElementClick(id, obj)
+    case "xy-click": cmdXyClick(id, obj)
+    case "type": cmdType(id, obj)
+    case "key": cmdKey(id, obj)
+    case "app-focus": cmdAppFocus(id, obj)
+    case "overlay-show": cmdOverlayShow(id, obj)
+    case "overlay-hide": cmdOverlayHide(id)
+    default: respondErr(id, "未知命令: \(cmd)", code: "unknown-cmd")
+    }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory) // 无 Dock 图标；叠加窗 orderFrontRegardless 显示、绝不 activate
+
+DispatchQueue.global(qos: .userInitiated).async {
+    while let line = readLine() {
+        autoreleasepool { handleLine(line) }
+    }
+    // stdin EOF：结束主线程 run loop（terminate），保持旧版「管道关闭即退出」的行为
+    DispatchQueue.main.async { app.terminate(nil) }
+}
+
+app.run()
+// run() 在 terminate 后返回，进程随之退出（退出码 0，与旧版一致）

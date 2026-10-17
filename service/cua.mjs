@@ -24,7 +24,12 @@
 //   - 策略门（policy kind 'cua_action'）：默认 cua_key 的 cmd+q / cmd+w（退程序/关窗）
 //     需人工确认令牌，其余直行；confirmCuaKeys 可在 policy-defaults.json 配置；
 //   - 物理验证：动作存「前证据」，cua_verify 取「后证据」成对返回；
-//   - 不做幻影光标；无 pid 的全局点击会移动真实光标（工具描述如实声明）；
+//   - 幽魂光标（v0.5.1）：点击前在目标位置 fire-and-forget 闪现琥珀色 AI 专属光标
+//     （A 层 helper 的 overlay-show；叠加窗点击穿透、不抢焦点、真鼠标不动），
+//     type/key 在最近一次点击 30 秒内于原地显示箭头提示「在原地输入」；
+//     叠加失败绝不影响真实动作，本身不记账（只是可视化，不是动作）；
+//     policy-defaults.json 的 cuaOverlay:false 可整体关闭（关闭后零调用）；
+//   - 无 pid 的全局点击会移动真实光标（工具描述如实声明）；
 //   - 永不做锁屏/解锁/绕过认证类功能。
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -43,6 +48,7 @@ const HELPER_TIMEOUT_MS = 15_000; // ax-tree 大树也要在 15s 内回来
 const OSA_TIMEOUT_MS = 15_000;
 const SHOT_TIMEOUT_MS = 15_000;
 const TYPE_MAX_CHARS = 4000;
+const OVERLAY_HINT_MS = 30_000; // type/key 在最近一次点击位置显示箭头提示的窗口期
 
 /** B 层（osascript）键码映射，与 Swift 端 KEY_CODES 一致（ANSI 布局）。 */
 const KEY_CODES = {
@@ -165,10 +171,11 @@ export function createHelperClient(binPath, { timeoutMs = HELPER_TIMEOUT_MS } = 
   }
 
   function spawnHelper() {
-    child = spawn(binPath, [], { stdio: ['pipe', 'pipe', 'ignore'] });
-    child.stdin?.on('error', () => { /* EPIPE：助手已死，在途请求由 exit 兜底 */ });
+    const proc = spawn(binPath, [], { stdio: ['pipe', 'pipe', 'ignore'] });
+    child = proc;
+    proc.stdin?.on('error', () => { /* EPIPE：助手已死，在途请求由 exit 兜底 */ });
     let buf = '';
-    child.stdout?.on('data', (chunk) => {
+    proc.stdout?.on('data', (chunk) => {
       buf += chunk.toString('utf8');
       let nl;
       while ((nl = buf.indexOf('\n')) >= 0) {
@@ -185,8 +192,17 @@ export function createHelperClient(binPath, { timeoutMs = HELPER_TIMEOUT_MS } = 
         else rec.reject(new CuaError(msg.error ?? 'helper error', msg.code));
       }
     });
-    child.on('exit', () => { child = null; failAll(`cua-helper exited unexpectedly (${binPath})`); });
-    child.on('error', (err) => { child = null; failAll(`cua-helper 启动失败: ${err.message}`); });
+    // 旧实例的 exit/error 不得波及已重启的新实例（stop → 立即重用时的事件竞态）
+    proc.on('exit', () => {
+      if (child !== proc) return;
+      child = null;
+      failAll(`cua-helper exited unexpectedly (${binPath})`);
+    });
+    proc.on('error', (err) => {
+      if (child !== proc) return;
+      child = null;
+      failAll(`cua-helper 启动失败: ${err.message}`);
+    });
   }
 
   return {
@@ -218,9 +234,13 @@ export function createHelperClient(binPath, { timeoutMs = HELPER_TIMEOUT_MS } = 
         }
       });
     },
-    /** 结束助手进程（MCP 会话退出时调用；无进程则空操作）。 */
+    /** 结束助手进程（MCP 会话退出时调用；无进程则空操作）。在途请求立即报 HELPER_DEAD。 */
     stop() {
-      if (child) { try { child.kill(); } catch { /* 已退出 */ } child = null; }
+      if (!child) return;
+      const proc = child;
+      child = null;
+      try { proc.kill(); } catch { /* 已退出 */ }
+      failAll('cua-helper stopped');
     },
   };
 }
@@ -458,16 +478,19 @@ const osaAppFocusScript = (app) => `tell application "System Events" to set fron
  * 创建 CUA 执行上下文（懒探测：构造零开销，首次使用才 spawn）。
  * @param {object} [opts]
  *   audit       —— service/audit.mjs 实例（动作留痕；缺省不留）
- *   policy      —— service/policy.mjs 实例（cua_key 确认门；缺省直行）
+ *   policy      —— service/policy.mjs 实例（cua_key 确认门 + cuaOverlay 叠加开关；缺省直行）
  *   helperPath  —— 助手二进制路径（默认 host/cua-helper；测试指向 fake）
  *   execRunner  —— 进程执行器（默认真实 spawn；测试注入 fake）
+ *   clock       —— 时钟函数（默认 Date.now；测试注入假时钟验证 30s 提示窗口）
  */
 export function createCua(opts = {}) {
   const { audit = null, policy = null } = opts;
   const execRunner = typeof opts.execRunner === 'function' ? opts.execRunner : realExec;
+  const clock = typeof opts.clock === 'function' ? opts.clock : Date.now;
   const helperPath = typeof opts.helperPath === 'string' && opts.helperPath ? opts.helperPath : HELPER_PATH;
   let helperClient = null;
   let lastEvidence = null; // {action, before, ts}：动作前证据（cua_verify 取后证据配对）
+  let lastClick = null; // {x, y, atMs}：最近一次点击位置（type/key 的箭头提示用）
 
   const helperCompiled = () => {
     try { return existsSync(helperPath); } catch { return false; }
@@ -482,6 +505,25 @@ export function createCua(opts = {}) {
 
   function requireMac() {
     if (!isMac()) throw new CuaError('屏幕操作（CUA）仅支持 macOS', 'UNSUPPORTED_PLATFORM');
+  }
+
+  // ---- 幽魂光标叠加（纯可视化：fire-and-forget，失败/关闭/无 helper 都零影响） ----
+
+  /** 叠加开关（policy-defaults.json 的 cuaOverlay，默认开）。 */
+  function overlayEnabled() { return policy ? policy.rules.cuaOverlay !== false : true; }
+
+  /** 在 (x,y) 闪一次叠加（kind: 'arrow'|'click'）。绝不被 await，失败自吞。 */
+  function overlayShow(x, y, kind) {
+    if (!overlayEnabled()) return;
+    const h = helper();
+    if (!h) return; // B/C 层无叠加能力：跳过（不影响任何动作）
+    h.request('overlay-show', { x, y, kind }).catch(() => { /* 叠加失败绝不影响真实动作 */ });
+  }
+
+  /** type/key 前的「在原地输入」提示：30 秒内点击过 → 在最近点击位置闪 arrow。 */
+  function overlayTypingHint() {
+    if (!lastClick || clock() - lastClick.atMs > OVERLAY_HINT_MS) return;
+    overlayShow(lastClick.x, lastClick.y, 'arrow');
   }
 
   // ---- 探测 ----
@@ -503,7 +545,11 @@ export function createCua(opts = {}) {
     if (!h) return null;
     try {
       const r = await h.request('probe');
-      return { axGranted: r.axGranted === true, screenGranted: r.screenGranted === true };
+      return {
+        axGranted: r.axGranted === true,
+        screenGranted: r.screenGranted === true,
+        ...(r.screen?.w && r.screen?.h ? { screen: { w: r.screen.w, h: r.screen.h } } : {}), // 主屏尺寸（自检定位叠加用）
+      };
     } catch (err) {
       return { axGranted: null, screenGranted: null, reason: err.message };
     }
@@ -517,18 +563,21 @@ export function createCua(opts = {}) {
       return {
         supported: false, tier: 'unsupported', platform: process.platform,
         helperCompiled: false, swiftcAvailable: false,
-        axGranted: null, screenGranted: null,
+        axGranted: null, screenGranted: null, screen: null,
+        overlay: { available: false, enabled: overlayEnabled() },
         capabilities: emptyCaps(), guidance: ['屏幕操作（CUA）仅支持 macOS，本平台不可用'],
       };
     }
     const compiled = helperCompiled();
     let axGranted = null;
     let screenGranted = null;
+    let screen = null;
     let probeReason = null;
     if (compiled) {
       const p = await probeViaHelper();
       axGranted = p?.axGranted ?? null;
       screenGranted = p?.screenGranted ?? null;
+      screen = p?.screen ?? null;
       probeReason = p?.reason ?? null;
     } else {
       axGranted = await probeAxViaOsa();
@@ -547,6 +596,8 @@ export function createCua(opts = {}) {
       swiftcAvailable: swiftcPath() !== null,
       axGranted,
       screenGranted,
+      ...(screen ? { screen } : {}),
+      overlay: { available: compiled, enabled: overlayEnabled() }, // 幽魂光标：仅 A 层（helper 叠加窗）
       ...(probeReason ? { probeError: probeReason } : {}),
       capabilities: capsFor(tier, compiled),
       guidance,
@@ -751,14 +802,22 @@ export function createCua(opts = {}) {
     }
   }
 
-  /** 找 pid 的屏上窗口对应的证据目标（A 层有 windowId；B 层退化为窗口 rect）。 */
+  /**
+   * 找 pid 的屏上窗口对应的证据目标（A 层有 windowId；B 层退化为窗口 rect）。
+   * 附 overlayPos（窗口 bounds 中心）：元素点击的幽魂光标近似位置（AX press 无坐标语义）。
+   */
   async function evidenceTargetForPid(pid) {
     try {
       const list = await windows();
       const win = list.find((w) => w.ownerPid === pid && w.onScreen) ?? list.find((w) => w.ownerPid === pid);
       if (!win) return null;
-      if (win.windowId) return { windowId: win.windowId };
-      if (win.bounds && (win.bounds.w > 0 || win.bounds.h > 0)) return { rect: win.bounds };
+      const hasBounds = win.bounds && (win.bounds.w > 0 || win.bounds.h > 0);
+      let target = null;
+      if (win.windowId) target = { windowId: win.windowId };
+      else if (hasBounds) target = { rect: win.bounds };
+      if (!target) return null;
+      if (hasBounds) target.overlayPos = { x: win.bounds.x + win.bounds.w / 2, y: win.bounds.y + win.bounds.h / 2 };
+      return target;
     } catch { /* 窗口清单拿不到 → 全屏证据 */ }
     return null;
   }
@@ -783,6 +842,8 @@ export function createCua(opts = {}) {
       const before = await snapshotEvidence(target);
       audit?.recordCua({ tool: 'click', mode: 'xy', pid, x, y });
       recordAction({ tool: 'cua_click', mode: 'xy', x, y, pid }, before);
+      overlayShow(x, y, 'click'); // 幽魂光标：注入前闪现（前证据已取完，不污染物理验证）
+      lastClick = { x, y, atMs: clock() };
       const r = await h.request('xy-click', { x, y, ...(pid ? { pid } : {}) });
       return { ok: true, mode: 'xy', x, y, targeted: r.targeted === true, ...(r.note ? { note: r.note } : {}) };
     }
@@ -795,9 +856,19 @@ export function createCua(opts = {}) {
     const before = await snapshotEvidence(beforeTarget);
     audit?.recordCua({ tool: 'click', mode: 'element', app, pid: targetPid, role, title });
     recordAction({ tool: 'cua_click', mode: 'element', app, pid: targetPid, role, title }, before);
+    // 幽魂光标：元素模式取目标窗口中心近似（AX press 无坐标语义），坐标兜底应答后精化到真实落点
+    if (beforeTarget?.overlayPos) {
+      overlayShow(beforeTarget.overlayPos.x, beforeTarget.overlayPos.y, 'click');
+      lastClick = { ...beforeTarget.overlayPos, atMs: clock() };
+    } else {
+      lastClick = null; // 位置未知时不给 type/key 提示陈旧坐标
+    }
     const h = helper();
     if (h) {
       const r = await h.request('element-click', { pid: targetPid, role, ...(title ? { title } : {}) });
+      if (Array.isArray(r.at) && Number.isFinite(r.at[0]) && Number.isFinite(r.at[1])) {
+        lastClick = { x: r.at[0], y: r.at[1], atMs: clock() }; // xyFallback 的真实落点
+      }
       return {
         ok: true, mode: 'element', pid: targetPid, role,
         ...(r.pressed ? { pressed: true } : { xyFallback: true, bounds: r.bounds, at: r.at }),
@@ -818,6 +889,7 @@ export function createCua(opts = {}) {
     const before = await snapshotEvidence(beforeTarget);
     audit?.recordCua({ tool: 'type', pid: targetPid, app, text });
     recordAction({ tool: 'cua_type', app, pid: targetPid, chars: text.length }, before);
+    overlayTypingHint(); // 30 秒内点击过 → 在最近点击位置闪 arrow（提示「在原地输入」）
     const h = helper();
     if (h) {
       const r = await h.request('type', { text, ...(targetPid ? { pid: targetPid } : {}) });
@@ -856,6 +928,7 @@ export function createCua(opts = {}) {
     const before = await snapshotEvidence(beforeTarget);
     audit?.recordCua({ tool: 'key', key: lowered, modifiers: mods, pid: targetPid, app });
     recordAction({ tool: 'cua_key', key: lowered, modifiers: mods, pid: targetPid }, before);
+    overlayTypingHint(); // 同 type：30 秒窗口内的原地输入提示
     const h = helper();
     if (h) {
       const r = await h.request('key', { key: lowered, modifiers: mods, ...(targetPid ? { pid: targetPid } : {}) });
@@ -909,6 +982,19 @@ export function createCua(opts = {}) {
     };
   }
 
+  /**
+   * 幽魂光标试闪（cua-selftest/调试用）：在给定坐标闪一次叠加后自动淡出。
+   * 只读可视化——不动任何应用、不记账；遵循 cuaOverlay 开关。
+   */
+  async function overlayFlash({ x, y, kind = 'arrow', durationMs } = {}) {
+    requireMac();
+    if (!overlayEnabled()) throw new CuaError('幽魂光标叠加已被 policy 关闭（cuaOverlay=false）', 'OVERLAY_DISABLED');
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new CuaError('试闪需要 x/y（数字，屏幕坐标）', 'BAD_ARGS');
+    const h = helper();
+    if (!h) throw new CuaError('幽魂光标叠加需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    return h.request('overlay-show', { x, y, kind, ...(Number.isInteger(durationMs) ? { durationMs } : {}) });
+  }
+
   return {
     status,
     windows,
@@ -919,6 +1005,7 @@ export function createCua(opts = {}) {
     key,
     appFocus,
     verify,
+    overlayFlash,
     /** 结束常驻助手进程（会话退出时调用）。 */
     stop() { helperClient?.stop(); },
   };
@@ -950,7 +1037,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_status', {
     title: '屏幕操作能力体检',
-    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, helperCompiled, swiftcAvailable, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS。首次使用 cua_* 前先跑这个。',
+    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。首次使用 cua_* 前先跑这个。',
     inputSchema: {},
   }, guard(async () => textResult(await cua.status())));
 
@@ -990,7 +1077,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_click', {
     title: '点击（元素优先，坐标兜底）',
-    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree。② 坐标 {x, y, pid?}——仅 A 层；给 pid 定向投递（不动真实光标），不给 pid 全局投递（会移动真实光标，慎用）。动作会自动留「前证据」，配合 cua_verify 物理验证。全审计。',
+    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree。② 坐标 {x, y, pid?}——仅 A 层；给 pid 定向投递（不动真实光标），不给 pid 全局投递（会移动真实光标，慎用）。动作会自动留「前证据」，配合 cua_verify 物理验证；点击位置闪现幽魂光标提示（叠加窗，policy 的 cuaOverlay 可关）。全审计。',
     inputSchema: {
       app: z.string().optional().describe('元素模式：目标应用名'),
       pid: z.number().int().optional().describe('目标进程 id（元素/坐标模式均可，坐标模式=定向投递）'),

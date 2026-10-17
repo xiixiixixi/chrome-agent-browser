@@ -1,4 +1,4 @@
-// test/cua.test.mjs — 屏幕操作（CUA，v0.5.0）测试：单元（注入 fake）+ Swift 助手自检。
+// test/cua.test.mjs — 屏幕操作（CUA，v0.5.1）测试：单元（注入 fake）+ Swift 助手自检。
 //
 // 覆盖：
 //   - 无 helper 时的优雅降级（cua_status 报 tier：osascript 可用=B / AX 拒=C）
@@ -8,8 +8,10 @@
 //   - 确认门（cua_key cmd+q 拦截 → ab_confirm 批准 → 带 token 放行；普通键直行）
 //   - cua_verify 证据组装（动作前证据 + 验证时后证据 + 防幻觉说明）
 //   - MCP 工具族（9 个 cua_* 注册；cua_status / cua_screenshot / cua_key 经 InMemoryTransport）
-//   - Swift 助手自检：swiftc 可用则编译到临时目录跑 probe/windows/ax-tree；
-//     编译失败/无 swiftc/非 macOS → SKIP（带原因，不算失败）
+//   - 幽魂光标（v0.5.1）：overlay-show 拼装/窗口中心近似/xyFallback 落点精化；失败不阻塞动作；
+//     cuaOverlay 开关（false 零调用）；type/key 30s 提示窗口（假时钟）；叠加不入审计、不污染前证据
+//   - Swift 助手自检：swiftc 可用则编译到临时目录跑 probe/windows/ax-tree（含 overlay 协议错误分支）；
+//     编译失败/无 swiftc/非 macOS → SKIP（带原因，不算失败）；源码级 overlay 协议/窗口要件断言
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -106,7 +108,7 @@ function fixture() {
 }
 
 const FAKE_HELPERS = {
-  probe: { axGranted: true, screenGranted: true },
+  probe: { axGranted: true, screenGranted: true, screen: { w: 1920, h: 1080 } },
   windows: { windows: [{ windowId: 42, ownerPid: 4321, ownerName: 'FakeApp', title: 'Fake Win', bounds: { x: 10, y: 20, w: 800, h: 600 }, onScreen: true }] },
   'ax-tree': { nodes: [{ depth: 0, role: 'AXWindow', title: 'Fake Win' }, { depth: 1, role: 'AXButton', title: 'OK' }], truncated: false },
   'element-click': { pressed: true },
@@ -114,6 +116,8 @@ const FAKE_HELPERS = {
   type: { chars: 5 },
   key: { key: 'q', keyCode: 12, modifiers: ['cmd'] },
   'app-focus': { axRaised: true, appActivated: true },
+  'overlay-show': {},
+  'overlay-hide': {},
 };
 
 /** 组一套 tier-A cua（fake helper + fake exec）。 */
@@ -242,6 +246,23 @@ test('helper 进程死亡：在途请求报错；下一次请求自动重启进�
     const second = await client.request('probe'); // 自动重启
     assert.equal(second.ok, true);
     assert.ok(readHelperLog(logFile).length >= 2, '重启后继续服务');
+  } finally {
+    client.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('helper stop 后立即复用：旧进程迟到的 exit 事件不得误杀新进程（自检重编译场景）', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'log');
+  const bin = writeFakeHelper(f.dir, FAKE_HELPERS, logFile);
+  const client = createHelperClient(bin, { timeoutMs: 4000 });
+  try {
+    assert.equal((await client.request('probe')).ok, true);
+    client.stop(); // 杀旧进程，但不等其 exit 事件落地
+    const second = await client.request('probe'); // 立即重用 → 应拉起新进程且不受旧 exit 波及
+    assert.equal(second.ok, true);
+    assert.notEqual(client.proc(), null, '新进程在役');
   } finally {
     client.stop();
     rmSync(f.dir, { recursive: true, force: true });
@@ -600,6 +621,14 @@ test('Swift 助手自检：编译到临时目录 → probe/windows/ax-tree（ax-
       // 未知键名：结构化错误
       const badKey = await client.request('key', { key: 'notakey' }).then((v) => v, (err) => err);
       assert.equal(badKey.code, 'unknown-key');
+
+      // overlay 协议（不闪真窗口：坏参数走结构化错误分支；overlay-hide 幂等 ok）
+      const badKind = await client.request('overlay-show', { x: 10, y: 10, kind: 'bogus' }).then((v) => v, (err) => err);
+      assert.equal(badKind.code, 'bad-kind');
+      const noXY = await client.request('overlay-show', { kind: 'arrow' }).then((v) => v, (err) => err);
+      assert.equal(noXY.code, 'bad-args');
+      const hidden = await client.request('overlay-hide');
+      assert.equal(hidden.ok, true);
     } finally {
       client.stop();
     }
@@ -614,4 +643,157 @@ test('swift 源码存在且 compileHelper 对缺失 SDK 的环境返回可读原
   assert.equal(typeof r.compiled, 'boolean');
   assert.ok(r.path, '返回结果带输出路径');
   if (!r.compiled) assert.ok(r.reason, '失败时必须带人话原因');
+});
+
+test('swift 源码实现 overlay 命令协议：点击穿透/不抢焦点/全屏可见/EOF 退出的窗口与线程模型要件', () => {
+  const src = readFileSync(SWIFT_SRC_PATH, 'utf8');
+  assert.match(src, /case "overlay-show"/, '分发 overlay-show');
+  assert.match(src, /case "overlay-hide"/, '分发 overlay-hide');
+  assert.match(src, /ignoresMouseEvents = true/, '叠加窗点击穿透');
+  assert.match(src, /\.nonactivatingPanel/, '非激活面板（不抢焦点）');
+  assert.match(src, /orderFrontRegardless/, '显示不 activate');
+  assert.match(src, /\.canJoinAllSpaces, \.fullScreenAuxiliary/, '全屏应用上也显示');
+  assert.match(src, /setActivationPolicy\(\.accessory\)/, '无 Dock 图标的附属应用');
+  assert.match(src, /DispatchQueue\.main\.async \{ app\.terminate/, 'stdin EOF → 主线程 terminate 退出');
+  assert.match(src, /srgbRed: 245 \/ 255, green: 158 \/ 255, blue: 11 \/ 255/, '琥珀色与扩展角标同色系（#f59e0b）');
+});
+
+// ---------- 9. 幽魂光标叠加（v0.5.1） ----------
+
+test('overlay：点击前 fire-and-forget overlay-show(kind=click)；元素模式取窗口中心；type 在 30s 内于最近点击位置提示 arrow', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'log');
+  const bin = writeFakeHelper(f.dir, FAKE_HELPERS, logFile);
+  let fakeNow = 1_000_000;
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec(), clock: () => fakeNow });
+  try {
+    // 坐标模式：叠加坐标 = 点击坐标
+    await cua.click({ x: 100, y: 200, pid: 4321 });
+    // 元素模式：叠加坐标 = 目标窗口（bounds 10,20,800,600）中心
+    await cua.click({ pid: 4321, role: 'AXButton', title: 'OK' });
+    // 30s 内 type：在最近点击位置（元素点击 pressed → 保持窗口中心）提示 arrow
+    await cua.type({ text: 'hi', pid: 4321 });
+    // 超出 30s 的 key：不提示
+    fakeNow += 30_001;
+    await cua.key({ key: 'a', modifiers: ['ctrl'], pid: 4321 });
+
+    const overlays = readHelperLog(logFile).filter((r) => r.cmd === 'overlay-show');
+    assert.equal(overlays.length, 3, '两次点击各一闪 + 一次输入提示');
+    assert.deepEqual(
+      overlays.map((o) => ({ x: o.x, y: o.y, kind: o.kind })),
+      [
+        { x: 100, y: 200, kind: 'click' },
+        { x: 410, y: 320, kind: 'click' }, // (10+800/2, 20+600/2)
+        { x: 410, y: 320, kind: 'arrow' },
+      ],
+    );
+    const log = readHelperLog(logFile);
+    assert.ok(log.some((r) => r.cmd === 'xy-click' && r.x === 100), '真实点击照常发出');
+    assert.ok(log.some((r) => r.cmd === 'element-click'), '元素点击照常发出');
+    assert.ok(log.some((r) => r.cmd === 'type'), '输入照常发出');
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('overlay：元素点击坐标兜底（xyFallback 带 at）时，输入提示精化到真实落点', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'log');
+  const bin = writeFakeHelper(f.dir, {
+    ...FAKE_HELPERS,
+    'element-click': { xyFallback: true, bounds: { x: 0, y: 0, w: 10, h: 10 }, at: [123, 456] },
+  }, logFile);
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec() });
+  try {
+    await cua.click({ pid: 4321, role: 'AXButton' });
+    await cua.type({ text: 'x', pid: 4321 });
+    const overlays = readHelperLog(logFile).filter((r) => r.cmd === 'overlay-show');
+    assert.deepEqual(
+      overlays.map((o) => ({ x: o.x, y: o.y, kind: o.kind })),
+      [{ x: 410, y: 320, kind: 'click' }, { x: 123, y: 456, kind: 'arrow' }], // 第二闪用 at 的真实落点
+    );
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('overlay 失败不影响点击：helper 对 overlay-show 应答 ok:false，点击/输入仍照常发出', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'log');
+  const bin = writeFakeHelper(f.dir, {
+    ...FAKE_HELPERS,
+    'overlay-show': { __err: 'no window server', code: 'overlay-failed' },
+  }, logFile);
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec() });
+  try {
+    const click = await cua.click({ x: 5, y: 6, pid: 4321 }); // fire-and-forget：拒绝不得冒泡
+    assert.equal(click.ok, true);
+    const typed = await cua.type({ text: 'hi', pid: 4321 }); // 输入提示失败同样吞掉
+    assert.equal(typed.ok, true);
+    const log = readHelperLog(logFile);
+    assert.ok(log.some((r) => r.cmd === 'overlay-show'), '叠加调用确实发出过');
+    assert.ok(log.some((r) => r.cmd === 'xy-click' && r.x === 5), '点击未被叠加失败阻塞');
+    assert.ok(log.some((r) => r.cmd === 'type'), '输入未被叠加失败阻塞');
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('overlay 开关（policy cuaOverlay）：默认开；false 时零调用且 status 如实报告；overlayFlash 关闭时报 OVERLAY_DISABLED', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'log');
+  const bin = writeFakeHelper(f.dir, FAKE_HELPERS, logFile);
+  const offPolicy = new Policy({ cuaOverlay: false }, {});
+  const cua = createCua({ audit: f.audit, policy: offPolicy, helperPath: bin, execRunner: fakeExec() });
+  try {
+    const st = await cua.status();
+    assert.deepEqual(st.overlay, { available: true, enabled: false });
+    await cua.click({ x: 1, y: 2, pid: 4321 });
+    await cua.click({ pid: 4321, role: 'AXButton' });
+    await cua.type({ text: 'hi', pid: 4321 });
+    await assert.rejects(cua.overlayFlash({ x: 1, y: 1 }), (err) => err.code === 'OVERLAY_DISABLED');
+    assert.equal(readHelperLog(logFile).filter((r) => r.cmd === 'overlay-show').length, 0, '关闭后零叠加调用');
+
+    const cuaOn = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec() }); // loadPolicy 默认 cuaOverlay=true
+    const stOn = await cuaOn.status();
+    assert.deepEqual(stOn.overlay, { available: true, enabled: true });
+    assert.deepEqual(stOn.screen, { w: 1920, h: 1080 }, 'probe 带主屏尺寸');
+    await cuaOn.click({ x: 9, y: 9, pid: 4321 });
+    assert.equal(readHelperLog(logFile).filter((r) => r.cmd === 'overlay-show').length, 1, '开启后恢复叠加');
+    cuaOn.stop();
+
+    // 无 helper（B/C 层）：overlay.available=false，click 不再发叠加请求
+    const cuaB = createCua({ audit: f.audit, policy: f.policy, helperPath: join(f.dir, 'nope'), execRunner: fakeExec({ osaOut: { frontmost: '555\n', __default: '' } }) });
+    const stB = await cuaB.status();
+    assert.deepEqual(stB.overlay, { available: false, enabled: true });
+    await cuaB.click({ pid: 555, role: 'AXButton' }); // B 层 osascript 路径：不抛叠加错
+    cuaB.stop();
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('overlay 不入审计（纯可视化，不是动作）；前证据截图不被叠加污染（取证先于叠加）', async () => {
+  const t = tierAFixture();
+  try {
+    await t.cua.click({ x: 111, y: 222, pid: 4321 });
+    await t.cua.type({ text: 'hi', pid: 4321 });
+    assert.equal(t.audit.query({ cmd: 'cua_click' }).entries.length, 1);
+    assert.equal(t.audit.query({ cmd: 'cua_type' }).entries.length, 1);
+    for (const cmd of ['cua_overlay', 'overlay_show', 'overlay']) {
+      assert.equal(t.audit.query({ cmd }).total, 0, `${cmd} 不得入账`);
+    }
+    // 顺序契约：helper 日志里 overlay-show 必须晚于取证截图（截图在前，叠加才不会入镜）
+    const log = readHelperLog(t.logFile);
+    const overlayIdx = log.findIndex((r) => r.cmd === 'overlay-show');
+    const xyIdx = log.findIndex((r) => r.cmd === 'xy-click');
+    assert.ok(overlayIdx >= 0 && xyIdx >= 0 && overlayIdx < xyIdx, '叠加在点击注入之前、取证之后');
+  } finally {
+    t.cua.stop();
+    rmSync(t.dir, { recursive: true, force: true });
+  }
 });

@@ -47,6 +47,8 @@ export class Policy {
       confirmCdp: Array.isArray(rules.confirmCdp) ? rules.confirmCdp : [],
       // cua_key 危险组合键（"cmd+q" 风格；默认退程序/关窗需确认，其余组合直行）
       confirmCuaKeys: Array.isArray(rules.confirmCuaKeys) ? rules.confirmCuaKeys.map(String) : ['cmd+q', 'cmd+w'],
+      // 幽魂光标叠加（AI 动手位置可见化；默认开，关掉后服务侧一切叠加调用跳过）
+      cuaOverlay: typeof rules.cuaOverlay === 'boolean' ? rules.cuaOverlay : true,
       maxTabsPerSession: Number.isFinite(rules.maxTabsPerSession) ? rules.maxTabsPerSession : Infinity,
     };
     this.blockedRes = null; // 惰性编译

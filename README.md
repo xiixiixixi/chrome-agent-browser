@@ -107,10 +107,10 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | `cua_status` / `cua_windows` | **屏幕能力体检**（当前到哪层+授权指引）/ 列出屏幕上的窗口 |
 | `cua_ax_tree` | 读任意应用的界面元素清单（AI 找"按钮叫什么"，比看截图猜坐标可靠） |
 | `cua_screenshot` | 屏幕/窗口/区域截图（PNG） |
-| `cua_click` / `cua_type` / `cua_key` | 屏幕级点击（元素优先、坐标兜底）/ 输入文本 / 按键（危险组合键过确认门） |
+| `cua_click` / `cua_type` / `cua_key` | 屏幕级点击（元素优先、坐标兜底；点击处闪现幽魂光标）/ 输入文本 / 按键（危险组合键过确认门） |
 | `cua_app_focus` / `cua_verify` | 应用切前台 / **物理验证**：返回动作前后两份截图证据，防"声称点了其实没点" |
 
-## 屏幕操作（CUA，v0.5.0）
+## 屏幕操作（CUA，v0.5.1）
 
 浏览器之外，同一服务还提供 `cua_*` 工具族操控**整块屏幕**（任何应用，不限于浏览器）。
 设计原则：**分层注入**（元素级 AX 动作优先，坐标兜底）、**AX 优先**（先读无障碍树再谈坐标）、
@@ -123,11 +123,16 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | **A**（最强） | `host/cua-helper` 已编译 + 辅助功能已授权 | ✓ | ✓（快） | ✓（AX 动作，失败自动取元素中心兜底） | ✓（**给 pid 定向投递，不动真实光标**） | ✓（可定向） | ✓ |
 | **B**（零编译兜底） | 无 helper，但辅助功能已授权（osascript + System Events） | ✓ | ✓（较慢） | ✓ | ✗ | ✓（进前台应用） | ✓ |
 | **C**（无任何授权） | 辅助功能未授权 | helper 编译过时 ✓（窗口表本身无需授权） | ✗ | ✗ | ✗ | ✗ | ✓（需屏幕录制授权） |
+| **幽魂光标**（A 层附属能力） | helper 已编译 | 点击位置闪现琥珀色 AI 专属光标（叠加窗实现） | — | ✓（元素模式取目标窗口中心近似） | ✓（精确坐标） | ✓（30 秒内点击过则在原地提示箭头） | — |
 
 - A 层助手是随包分发的单文件 Swift 源码（`swift/cua-helper.swift`），`npm run setup` 自动用本机
   swiftc 编译成 `host/cua-helper`（编译产物不入库；无 swiftc 时静默落到 B 层，不算安装失败）。
-- `cua_status` 随时报告 `{tier, axGranted, screenGranted, helperCompiled, swiftcAvailable, capabilities, guidance}`；
-  `npm run cua-selftest` 是只读的交互动全清单自检（**不做任何点击**，安全默认）。
+- **幽魂光标（v0.5.1）**：AI 每次点击会在目标位置短暂闪现琥珀色 AI 光标（与扩展角标同色系，
+  点击带一圈扩散涟漪，约 0.7 秒后淡出），输入则原地提示箭头——让你看得见 AI 动手在哪。
+  叠加窗实现：**点击穿透、不抢焦点、真鼠标不动、无新系统权限**；叠加失败绝不影响真实动作，
+  也不入审计（纯可视化）。`service/policy-defaults.json` 的 `"cuaOverlay": false` 可整体关闭。
+- `cua_status` 随时报告 `{tier, axGranted, screenGranted, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}`；
+  `npm run cua-selftest` 是只读的交互动全清单自检（**不做任何点击**，含一次屏幕中央幽魂光标试闪，安全默认）。
 
 ### 两条授权怎么开（人话）
 
@@ -150,7 +155,9 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 
 - 坐标点击分两档：**给 pid = 定向投递给目标进程（真实鼠标不动）**；不给 pid = 全局投递
   （**会移动你的真实光标**，工具描述已标明，慎用）。
-- 不做"幻影光标"（在屏幕上画一个假 AI 光标）之类的演示层。
+- **幽魂光标**：点击位置显示琥珀色 AI 光标（叠加窗实现，无新系统权限、点击穿透、不抢焦点、
+  真鼠标不动），短暂显示后自动淡出；仅 A 层可用，`cuaOverlay` 可关。元素点击（AX press 无
+  坐标语义）取目标窗口中心近似，坐标兜底时会精化到真实落点。
 - **锁屏/解锁/绕过任何认证类功能永不做**；助手二进制里也没有这类能力。
 - B 层（osascript）没有坐标点击与定向投递能力；窗口标题的可见性受系统隐私裁剪影响
   （工具会用无障碍接口尽力回填，回填不到就如实留空）。

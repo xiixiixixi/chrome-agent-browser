@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // cua-selftest.mjs —— 屏幕操作（CUA）交互动全清单自检：探测 → 编译 → windows →
-// （有授权则）ax-tree + 截图，输出人话报告。
+// （有授权则）ax-tree + 截图 + 幽魂光标试闪，输出人话报告。
 //
-// 安全默认：本自检不做任何点击/输入/按键（只读探测 + 截一小块区域）。
+// 安全默认：本自检不做任何点击/输入/按键（只读探测 + 截一小块区域 +
+// 屏幕中央闪一次叠加光标——纯可视化，点击穿透、不动任何应用与真鼠标）。
 // 用法：npm run cua-selftest
 // 退出码：探测链路本身能跑通即 0（未授权/未编译等降级项如实报告，不算失败）。
 
@@ -94,6 +95,34 @@ try {
     return `jpeg ${s.bytes} 字节`;
   });
   if (shot) log(`jpeg ${shot}（截到画面说明屏幕录制授权有效）`);
+
+  // 6. 幽魂光标试闪（只读叠加：屏幕中央闪 800ms 后自动淡出，不动任何应用/真鼠标）
+  if (!st.supported || !st.overlay?.available) {
+    log('\n跳过幽魂光标试闪：叠加层需 A 层助手（host/cua-helper 未编译，跑一次 npm run setup）');
+  } else if (st.overlay?.enabled === false) {
+    log('\n跳过幽魂光标试闪：已在 policy 关闭（cuaOverlay=false）');
+  } else {
+    const flash = await step('幽魂光标试闪（overlay-show，屏幕中央 800ms）', async () => {
+      const w = st.screen?.w ?? 1920;
+      const h = st.screen?.h ?? 1080;
+      const tryFlash = () => cua.overlayFlash({ x: Math.round(w / 2), y: Math.round(h / 2), kind: 'click', durationMs: 800 });
+      let r;
+      try {
+        r = await tryFlash();
+      } catch (err) {
+        // 已编译的二进制是旧版（升级源码后没重跑 setup）：有 swiftc 就地重编译后重试一次
+        if (err.code !== 'unknown-cmd' || !st.swiftcAvailable) throw err;
+        const built = compileHelper({ log: () => {} });
+        if (!built.compiled) throw err; // 重编译失败按原错误报告
+        cua.stop(); // 结束常驻的旧二进制进程，下次请求自动从新编译产物拉起
+        log('检测到旧版 host/cua-helper（无 overlay 命令），已就地重编译 → 重试');
+        r = await tryFlash();
+      }
+      if (r.ok !== true) throw new Error(r.error ?? 'helper 未返回 ok');
+      return `helper 返回 ok（此刻屏幕中央应闪过琥珀色 AI 光标 + 一圈涟漪后淡出）`;
+    });
+    if (flash) log(flash);
+  }
 } finally {
   cua.stop();
 }

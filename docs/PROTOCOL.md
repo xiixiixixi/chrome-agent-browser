@@ -109,7 +109,7 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 - 高危动作（转账/发送/删除/下载执行/CDP 危险面）由 service 的 policy 模块拦截 → `POLICY_BLOCKED`，data 里带需要的人类确认句柄。
 - MCP 面的确认通过 MCP elicitation（不支持时降级为：返回待确认描述，由调用方人工批准后带 confirmation token 重试）。
 
-## 6b. 屏幕操作工具族（cua_*，v0.5.0）
+## 6b. 屏幕操作工具族（cua_*，v0.5.1）
 
 `cua_*` 是浏览器链路之外的**屏幕级**操控面（任何应用），与 MCP 服务同进程
 （`service/cua.mjs`，注册于 `service/mcp.mjs`），不经过 extension→host→service 线缆。
@@ -118,14 +118,14 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 
 | 层 | 执行体 | 能力 |
 |---|---|---|
-| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate） |
+| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate）/ overlay-show · overlay-hide（幽魂光标叠加） |
 | B | osascript + System Events（零编译兜底） | 同形状的 ax-tree / element-click / type / key / app-focus / windows（较慢；无坐标能力；窗口无 CGWindowID，截图用 rect） |
 | C | 无任何授权 | windows（仅 helper 编译过时走 CGWindowList，窗口表本身无需授权）+ 截图（screencapture，需屏幕录制授权） |
 
 - helper 行协议：stdin 每行一个 JSON 请求 `{id, cmd, ...参数}`，stdout 每行一个 JSON 响应
   `{id, ok:true, ...}` | `{id, ok:false, error, code?}`；常驻进程、按 id 配对、死亡自动重启。
-- 权限探测：helper `probe` → `{axGranted: AXIsProcessTrusted, screenGranted: CGPreflightScreenCaptureAccess}`；
-  无 helper 时 AX 用 osascript 试探（不可靠的项如实报 unknown）。
+- 权限探测：helper `probe` → `{axGranted: AXIsProcessTrusted, screenGranted: CGPreflightScreenCaptureAccess,
+  screen:{w,h} 主屏尺寸}`；无 helper 时 AX 用 osascript 试探（不可靠的项如实报 unknown）。
 - tier 判定：A = helper 且 AX 已授权；B = 无 helper 但 AX 已授权；C = AX 未授权；非 macOS = unsupported。
 
 ### MCP 工具（9 个）
@@ -151,8 +151,31 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
   其余动作直行；未知 kind 仍 fail-closed。
 - 截图统一走 `screencapture` 子进程（`-x` 静默；窗口 `-l<windowId>`；区域 `-Rx,y,w,h`；临时文件读回即删）。
 
+### 幽魂光标叠加（overlay，v0.5.1）
+
+helper 新增两条命令（均在 v0.5.1 的线程模型下工作：主线程跑 AppKit run loop，
+stdin 由后台队列逐行读，窗口操作经主队列执行，stdin EOF → terminate 退出）：
+
+- `overlay-show {x, y, kind:'arrow'|'click', durationMs?}` → `{ok:true}`：在屏幕坐标 (x,y)
+  闪现琥珀色（#f59e0b，与扩展角标同色系）AI 专属箭头；kind=click 追加约 350ms 扩散涟漪；
+  durationMs（默认 700，夹取 100..5000）后淡出并 orderOut。窗口为懒创建复用的 140×140
+  borderless NSPanel：level=floating+2、isOpaque=false、backgroundColor=clear、
+  **ignoresMouseEvents=true（点击穿透）**、collectionBehavior=[canJoinAllSpaces,
+  fullScreenAuxiliary]（全屏应用上也显示）、hidesOnDeactivate=false，**绝不 activate**；
+  绘制为纯代码 NSBezierPath（箭头 + 白描边 + 阴影外发光），无资源文件。
+  参数不合法 → `{ok:false, code:'bad-args'|'bad-kind'}`；任何失败只回错误，不影响主命令循环。
+- `overlay-hide` → `{ok:true}`：取消在途淡出/涟漪并立即隐藏（幂等）。
+
+服务侧集成（`service/cua.mjs`）：**点击类动作在注入前** fire-and-forget 调 overlay-show
+（坐标模式用点击坐标；元素模式用目标窗口中心近似——AX press 无坐标语义，坐标兜底应答的
+`at` 会把后续输入提示精化到真实落点）；**type/key 在最近一次点击 30 秒内**于原地显示 arrow。
+叠加在「前证据」截图之后、注入之前触发（不入镜、不污染物理验证）；失败自吞、绝不阻塞真实
+动作；本身不入审计（纯可视化）。开关：policy-defaults.json 的 `cuaOverlay`（默认 true），
+关闭后零调用；`cua_status` 以 `overlay:{available,enabled}` 如实报告（仅 A 层 available）。
+
 ### 永不做的
 
-锁屏/解锁/绕过认证类能力（helper 二进制中不存在对应命令）；幻影光标/演示层。
-无 pid 的全局坐标点击会移动真实光标——工具描述如实声明，这是唯一会动用户光标的操作。
+锁屏/解锁/绕过认证类能力（helper 二进制中不存在对应命令）。
+无 pid 的全局坐标点击会移动真实光标——工具描述如实声明，这是唯一会动用户光标的操作
+（幽魂光标是叠加窗可视化，点击穿透、不动真鼠标、不抢焦点）。
 
