@@ -17,7 +17,7 @@ import { computeExtensionId, parseArgs as parseInstallArgs, runInstall, FAMILY_N
 import { installedBrowsers } from './installer/discovery.mjs';
 import { ConnectionManager } from './service/connection.mjs';
 import { compileHelper, createCua } from './service/cua.mjs';
-import { missingPermissions } from './service/cua-guide.mjs';
+import { missingPermissions, showGuideCards } from './service/cua-guide.mjs';
 
 // setup.mjs 位于仓库根，REPO_ROOT 就是它所在目录（此前误用 '..' 多退一级）
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -133,7 +133,11 @@ async function main() {
   if (cua.compiled) {
     log('   ✓ 已编译 host/cua-helper（A 层：窗口清单 / AX 元素操作 / 定向坐标点击）');
     // v0.5.3：编译成功即自动探测权限并向系统申请（非交互：弹完对话框打印指引，不等待）
+    // v0.5.4：申请的同时浮起琥珀引导卡片留在屏幕上带路（120 秒后自动淡出）。
+    //   卡片是 helper 进程的窗口——本轮显示过卡片就不 stop helper：本脚本退出后 helper
+    //   随 stdin EOF 留守到卡片全数收起才退（helper 侧保证，寿命封顶 600s）。
     const cuaCtx = createCua({});
+    let cardsShown = [];
     try {
       const st = await cuaCtx.status();
       const miss = missingPermissions(st);
@@ -148,16 +152,23 @@ async function main() {
           dialogsPopped = false;
           log(`   - 自动申请未完成（${err.message}），请手动到系统设置里勾选：`);
         }
+        cardsShown = await showGuideCards(cuaCtx, miss, name, { log: (m) => log(`   ${m}`) });
+        if (cardsShown.length) {
+          try { await cuaCtx.openPrivacyPane(miss.ax ? 'accessibility' : 'screen'); } catch { /* 打不开面板不算事：指引里有路径 */ }
+        }
         log('');
         log('   ⚠ 屏幕操作（CUA）需要两个 macOS 权限');
-        log(`   ${dialogsPopped ? '系统刚才弹了授权对话框，请到' : '请到'} 系统设置→隐私与安全性 里：`);
-        if (miss.ax) log(`     ① 辅助功能 → 勾选「${name}」`);
-        if (miss.screen) log(`     ${miss.ax ? '②' : '①'} 屏幕录制 → 勾选「${name}」`);
+        log(`   ${dialogsPopped ? '系统刚才弹了授权对话框' : '请手动到系统设置'}，${cardsShown.length ? '屏幕上已出现引导卡片，拖进系统设置列表即可授权；' : '请到系统设置→隐私与安全性 里：'}`);
+        if (!cardsShown.length) {
+          if (miss.ax) log(`     ① 辅助功能 → 勾选「${name}」`);
+          if (miss.screen) log(`     ${miss.ax ? '②' : '①'} 屏幕录制 → 勾选「${name}」`);
+        }
         log('     完成后运行 npm run cua-selftest 验证');
         log('     （不授权也能用 B 层 osascript 与窗口清单，但没有坐标点击与截图）');
       }
     } finally {
-      cuaCtx.stop();
+      // 留过卡片就不杀 helper（卡片与 helper 共存亡，淡出后 helper 自退）；否则照常收尾
+      if (!cardsShown.length) cuaCtx.stop();
     }
   } else if (cua.skipped) {
     log('   - 跳过：非 macOS 平台，cua_* 工具族不可用（其余功能不受影响）。');

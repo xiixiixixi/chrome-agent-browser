@@ -11,9 +11,13 @@
 //   - 幽魂光标（v0.5.1）：overlay-show 拼装/窗口中心近似/xyFallback 落点精化；失败不阻塞动作；
 //     cuaOverlay 开关（false 零调用）；type/key 30s 提示窗口（假时钟）；叠加不入审计、不污染前证据
 //   - 授权引导（v0.5.3）：requestPermissions 协议拼装/解析（fake helper + 旧 helper unknown-cmd
-//     就地重编译重试）；status 新字段 responsibleProcess/permissionGuide（全授权时 guide=null；
-//     status 绝不触发申请——探测无副作用）；runGuidedGrant 分支（已授权/非 TTY/跳过/申请+复测/
-//     申请失败）；纯函数 missingPermissions/permissionGuideText/degradedNote
+//     就地重编译重试）；status 新字段 responsibleProcess/permissionGuide（v0.5.4 起 {text,card}；
+//     全授权时 guide=null；status 绝不触发申请——探测无副作用）；runGuidedGrant 分支（已授权/
+//     非 TTY/跳过/申请+复测/申请失败）；纯函数 missingPermissions/permissionGuideText/degradedNote
+//   - 引导卡片（v0.5.4）：show/hidePermissionCard 协议拼装与 kind 校验；openPrivacyPane 面板 URL；
+//     runGuidedGrant 申请后浮卡+开面板、复测/跳过都收卡、旧 helper 静默降级；纯函数
+//     missingCardKinds/showGuideCards/hideGuideCards；Swift 源码要件（可交互面板/拖拽句柄/
+//     双卡错位/EOF 留守）+ 真编译产物的双卡不重叠/就地更新/幂等隐藏
 //   - Swift 助手自检：swiftc 可用则编译到临时目录跑 probe/windows/ax-tree（含 overlay 协议错误分支）；
 //     编译失败/无 swiftc/非 macOS → SKIP（带原因，不算失败）；源码级 overlay/授权申请协议要件断言
 
@@ -37,7 +41,8 @@ import {
   createCua, createHelperClient, compileHelper, swiftcPath, keyCombo, SWIFT_SRC_PATH,
 } from '../service/cua.mjs';
 import {
-  missingPermissions, permissionGuideText, cTierNote, degradedNote, runGuidedGrant,
+  missingPermissions, missingCardKinds, permissionGuideText, cTierNote, degradedNote, runGuidedGrant,
+  showGuideCards, hideGuideCards, CARD_DEFAULT_SEC,
 } from '../service/cua-guide.mjs';
 
 const CUA_TOOLS = [
@@ -126,6 +131,8 @@ const FAKE_HELPERS = {
   'overlay-show': {},
   'overlay-hide': {},
   'request-permissions': { axGranted: false, axRequested: true, screenGranted: false, screenRequested: true, responsibleProcess: 'Ghostty' },
+  'show-permission-card': { autoHideSec: 120, frame: { x: 800, y: 400, w: 300, h: 116 }, dragFrom: '/Applications/Ghostty.app' },
+  'hide-permission-card': {},
 };
 
 /** 组一套 tier-A cua（fake helper + fake exec）。 */
@@ -638,6 +645,29 @@ test('Swift 助手自检：编译到临时目录 → probe/windows/ax-tree（ax-
       assert.equal(noXY.code, 'bad-args');
       const hidden = await client.request('overlay-hide');
       assert.equal(hidden.ok, true);
+
+      // permission-card 协议（真窗口能力：卡片会真闪现 <1 秒，随即收起——被测的就是窗口本身）
+      const badCard = await client.request('show-permission-card', { kind: 'bogus' }).then((v) => v, (err) => err);
+      assert.equal(badCard.code, 'bad-kind');
+      const noCardKind = await client.request('show-permission-card', {}).then((v) => v, (err) => err);
+      assert.equal(noCardKind.code, 'bad-kind');
+      assert.equal((await client.request('hide-permission-card', { kind: 'accessibility' })).ok, true, '未显示的 kind 隐藏幂等 ok');
+      const cardA = await client.request('show-permission-card', { kind: 'accessibility', appName: 'Ghostty', durationSec: 5 });
+      const cardS = await client.request('show-permission-card', { kind: 'screen', appName: 'Ghostty', durationSec: 5 });
+      for (const c of [cardA, cardS]) {
+        assert.equal(c.ok, true);
+        assert.equal(c.autoHideSec, 5);
+        assert.ok(c.frame && Number.isFinite(c.frame.x) && Number.isFinite(c.frame.y) && c.frame.w > 0 && c.frame.h > 0, '应答带屏幕左上原点 frame');
+      }
+      const fa = cardA.frame;
+      const fs = cardS.frame;
+      const disjoint = fa.x + fa.w <= fs.x || fs.x + fs.w <= fa.x || fa.y + fa.h <= fs.y || fs.y + fs.h <= fa.y;
+      assert.equal(disjoint, true, '双卡错位排布不重叠');
+      const cardA2 = await client.request('show-permission-card', { kind: 'accessibility', appName: 'iTerm', durationSec: 5 });
+      assert.equal(cardA2.frame.x, fa.x, '同 kind 再 show=就地更新，保留位置');
+      assert.equal(cardA2.frame.y, fa.y);
+      assert.equal((await client.request('hide-permission-card', { kind: 'accessibility' })).ok, true);
+      assert.equal((await client.request('hide-permission-card', { kind: 'screen' })).ok, true);
     } finally {
       client.stop();
     }
@@ -663,7 +693,7 @@ test('swift 源码实现 overlay 命令协议：点击穿透/不抢焦点/全屏
   assert.match(src, /orderFrontRegardless/, '显示不 activate');
   assert.match(src, /\.canJoinAllSpaces, \.fullScreenAuxiliary/, '全屏应用上也显示');
   assert.match(src, /setActivationPolicy\(\.accessory\)/, '无 Dock 图标的附属应用');
-  assert.match(src, /DispatchQueue\.main\.async \{ app\.terminate/, 'stdin EOF → 主线程 terminate 退出');
+  assert.match(src, /DispatchQueue\.main\.async \{ permissionCards\.noteStdinClosed\(\) \}/, 'stdin EOF → 主线程决策退出（v0.5.4 起卡片在屏时留守）');
   assert.match(src, /srgbRed: 245 \/ 255, green: 158 \/ 255, blue: 11 \/ 255/, '琥珀色与扩展角标同色系（#f59e0b）');
 });
 
@@ -680,6 +710,24 @@ test('swift 源码实现 request-permissions 协议：系统标准申请 API + �
   assert.match(src, /parentPid\(getpid\(\)\)/, '负责进程名从父进程起步（跳过 NSApplication 自注册的本进程）');
   assert.match(src, /bundleIdentifier/, '只认带 bundle 的真 App（终端）');
   assert.match(src, /usleep\(500_000\)/, '静置 ~500ms 让系统弹窗出现后即返回（不阻塞）');
+});
+
+test('swift 源码实现 permission-card 协议：可交互面板/可拖动/文件拖拽句柄/双卡错位/EOF 留守要件', () => {
+  const src = readFileSync(SWIFT_SRC_PATH, 'utf8');
+  assert.match(src, /case "show-permission-card"/, '分发 show-permission-card');
+  assert.match(src, /case "hide-permission-card"/, '分发 hide-permission-card');
+  assert.match(src, /panel\.ignoresMouseEvents = false/, '引导卡片是唯一可交互的叠加窗（与幽灵光标的穿透相反）');
+  assert.match(src, /panel\.isMovableByWindowBackground = true/, '拖卡片背景=挪位置');
+  assert.match(src, /panel\.level = \.floating/, '浮在系统设置上方');
+  assert.match(src, /\.nonactivatingPanel/, '非激活面板（不抢系统设置的焦点）');
+  assert.match(src, /beginDraggingSession/, '图标句柄发起文件拖拽');
+  assert.match(src, /NSDraggingSource/, '拖拽源协议');
+  assert.match(src, /responsibleAppBundleURL\(\)/, '拖拽 promise 的是负责进程的 .app bundle（TCC 记账对象）');
+  assert.match(src, /CARD_H \+ CARD_GAP/, '双卡纵向错位（accessibility 在上、screen 在下）');
+  assert.match(src, /noteStdinClosed\(\)/, 'stdin EOF 经卡片控制器决策');
+  assert.match(src, /exitAfterCardsClose/, '卡片在屏时留守、收齐再退（setup 非交互留卡）');
+  assert.match(src, /"dragFrom"/, '应答透传拖拽句柄的 .app 路径');
+  assert.match(src, /"frame"/, '应答带屏幕坐标 frame（两卡不重叠的可测依据）');
 });
 
 // ---------- 9. 幽魂光标叠加（v0.5.1） ----------
@@ -883,7 +931,7 @@ test('旧版 helper 无 request-permissions（unknown-cmd）：引导层就地�
   }
 });
 
-test('status 新字段：responsibleProcess 透传；缺权限时 permissionGuide 含面板路径与勾选名；全授权时 guide=null', async () => {
+test('status 新字段：responsibleProcess 透传；缺权限时 permissionGuide={text,card} 含面板路径与勾选名；全授权时 guide=null', async () => {
   const f = fixture();
   const logFile = join(f.dir, 'log');
   const bin = writeFakeHelper(f.dir, {
@@ -895,10 +943,11 @@ test('status 新字段：responsibleProcess 透传；缺权限时 permissionGuid
     const st = await cua.status();
     assert.equal(st.tier, 'C', 'AX 未授权 → C 层');
     assert.equal(st.responsibleProcess, 'Ghostty');
-    assert.ok(st.permissionGuide.includes('系统设置'), '指引含面板路径');
-    assert.ok(st.permissionGuide.includes('辅助功能'));
-    assert.ok(st.permissionGuide.includes('屏幕录制'));
-    assert.ok(st.permissionGuide.includes('Ghostty'), '指引含要勾选的名字');
+    assert.ok(st.permissionGuide.text.includes('系统设置'), '指引含面板路径');
+    assert.ok(st.permissionGuide.text.includes('辅助功能'));
+    assert.ok(st.permissionGuide.text.includes('屏幕录制'));
+    assert.ok(st.permissionGuide.text.includes('Ghostty'), '指引含要勾选的名字');
+    assert.equal(st.permissionGuide.card, true, 'A 层 helper 在位 → 有悬浮引导卡片能力');
     // status 是纯探测：绝不能触发申请（request-permissions 不入 helper 日志）
     assert.equal(readHelperLog(logFile).filter((req) => req.cmd === 'request-permissions').length, 0, 'status 不得触发权限申请');
   } finally {
@@ -918,15 +967,16 @@ test('status 新字段：responsibleProcess 透传；缺权限时 permissionGuid
     rmSync(t.dir, { recursive: true, force: true });
   }
 
-  // B 层（无 helper）：responsibleProcess=null；AX 已授权但屏幕未知 → 指引只提屏幕录制
+  // B 层（无 helper）：responsibleProcess=null；AX 已授权但屏幕未知 → 指引只提屏幕录制、card=false（无卡片能力）
   const f2 = fixture();
   const cuaB = createCua({ audit: f2.audit, policy: f2.policy, helperPath: join(f2.dir, 'nope'), execRunner: fakeExec({ osaOut: { frontmost: '555\n', __default: '' } }) });
   try {
     const stB = await cuaB.status();
     assert.equal(stB.tier, 'B');
     assert.equal(stB.responsibleProcess, null, '无 helper 时拿不到负责进程名（如实）');
-    assert.ok(stB.permissionGuide.includes('屏幕录制'));
-    assert.ok(!stB.permissionGuide.includes('辅助功能'), 'AX 已授权就不在指引里重复');
+    assert.ok(stB.permissionGuide.text.includes('屏幕录制'));
+    assert.ok(!stB.permissionGuide.text.includes('辅助功能'), 'AX 已授权就不在指引里重复');
+    assert.equal(stB.permissionGuide.card, false, '无 helper → 无卡片能力（如实报告）');
   } finally {
     cuaB.stop();
     rmSync(f2.dir, { recursive: true, force: true });
@@ -993,7 +1043,7 @@ test('runGuidedGrant 正常引导：两问推进、申请一次、复测 status 
   assert.ok(text.includes('第 2 步') && text.includes('屏幕录制'));
   assert.ok(text.includes('Ghostty'), '引导里给要勾选的名字');
   assert.ok(io.prompts[0].includes('按回车开始申请'), '第一问=开始申请');
-  assert.ok(io.prompts[1].includes('开好后按回车'), '第二问=开好后验证');
+  assert.ok(io.prompts[1].includes('琥珀色引导卡片') && io.prompts[1].includes('完成后按回车'), '第二问=看卡片带路（v0.5.4 起本 fake 有卡片能力）');
 
   // 申请抛错（如 helper 消失）：mode=error 带原错误，不崩
   const bad = await runGuidedGrant({
@@ -1006,17 +1056,20 @@ test('runGuidedGrant 正常引导：两问推进、申请一次、复测 status 
   assert.match(bad.error.message, /helper died/);
 });
 
-/** fake cua：只实现引导所需的 status/requestPermissions/stop，调用计数进 calls。 */
-function fakeCua({ st = {}, failWith = null } = {}) {
-  const calls = { status: 0, requestPermissions: 0 };
+/** fake cua：只实现引导所需的 status/requestPermissions/卡片方法/stop，调用计数进 calls。 */
+function fakeCua({ st = {}, failWith = null, permResult = null } = {}) {
+  const calls = { status: 0, requestPermissions: 0, showCard: [], hideCard: [], openPane: [] };
   return {
     calls,
     async status() { calls.status += 1; return { ...st }; },
     async requestPermissions() {
       calls.requestPermissions += 1;
       if (failWith) throw failWith;
-      return { axGranted: false, axRequested: true, screenGranted: false, screenRequested: true, responsibleProcess: 'Ghostty' };
+      return permResult ?? { axGranted: false, axRequested: true, screenGranted: false, screenRequested: true, responsibleProcess: 'Ghostty' };
     },
+    async showPermissionCard({ kind, appName, durationSec } = {}) { calls.showCard.push({ kind, appName, durationSec }); return { kind }; },
+    async hidePermissionCard(kind) { calls.hideCard.push(kind); },
+    async openPrivacyPane(kind) { calls.openPane.push(kind); },
     stop() {},
   };
 }
@@ -1039,4 +1092,206 @@ test('引导纯函数：missingPermissions/permissionGuideText/degradedNote 的�
   assert.ok(degradedNote({ axGranted: false, screenGranted: false }).includes('C 层'), 'AX 缺 → C 层说明');
   assert.ok(degradedNote({ axGranted: true, screenGranted: false }).includes('屏幕录制'), '只缺屏幕 → 截图降级说明（不误报 C 层）');
   assert.ok(!degradedNote({ axGranted: true, screenGranted: false }).includes('C 层'));
+});
+
+// ---------- 11. 权限引导悬浮卡片（v0.5.4） ----------
+
+test('引导卡片协议：showPermissionCard/hidePermissionCard 拼装单行请求、响应映射 frame/dragFrom；kind 校验；无 helper/旧 helper 降级', async () => {
+  const t = tierAFixture();
+  try {
+    const shown = await t.cua.showPermissionCard({ kind: 'accessibility', appName: 'Ghostty', durationSec: 60 });
+    assert.equal(shown.ok, true);
+    assert.equal(shown.kind, 'accessibility');
+    assert.deepEqual(shown.frame, { x: 800, y: 400, w: 300, h: 116 });
+    assert.equal(shown.dragFrom, '/Applications/Ghostty.app', '透传拖拽句柄 promise 的 .app 路径');
+
+    const hidden = await t.cua.hidePermissionCard('screen');
+    assert.deepEqual(hidden, { kind: 'screen', hidden: true });
+
+    // 默认不传 durationSec：请求里不带该字段（由 helper 端取默认 120）
+    await t.cua.showPermissionCard({ kind: 'screen', appName: '' });
+    const log = readHelperLog(t.logFile);
+    const shows = log.filter((r) => r.cmd === 'show-permission-card');
+    assert.deepEqual(
+      shows.map((r) => ({ kind: r.kind, appName: r.appName, durationSec: r.durationSec })),
+      [
+        { kind: 'accessibility', appName: 'Ghostty', durationSec: 60 },
+        { kind: 'screen', appName: '', durationSec: undefined },
+      ],
+      '参数形状：kind/appName 逐字、durationSec 只在显式给时携带',
+    );
+    assert.ok(log.some((r) => r.cmd === 'hide-permission-card' && r.kind === 'screen'));
+
+    // kind 校验：show/hide 都拒绝非法值
+    await assert.rejects(t.cua.showPermissionCard({ kind: 'bogus' }), (err) => err.code === 'BAD_ARGS');
+    await assert.rejects(t.cua.showPermissionCard({}), (err) => err.code === 'BAD_ARGS');
+    await assert.rejects(t.cua.hidePermissionCard('bogus'), (err) => err.code === 'BAD_ARGS');
+    await assert.rejects(t.cua.hidePermissionCard(), (err) => err.code === 'BAD_ARGS');
+  } finally {
+    t.cua.stop();
+    rmSync(t.dir, { recursive: true, force: true });
+  }
+
+  // 无 helper（B/C 层）：明确报 CAPABILITY_UNAVAILABLE（引导层据此静默降级为纯文字）
+  const f = fixture();
+  try {
+    const noHelper = createCua({ audit: f.audit, policy: f.policy, helperPath: join(f.dir, 'nope'), execRunner: fakeExec() });
+    await assert.rejects(noHelper.showPermissionCard({ kind: 'accessibility' }), (err) => err.code === 'CAPABILITY_UNAVAILABLE' && /setup/.test(err.message));
+    await assert.rejects(noHelper.hidePermissionCard('accessibility'), (err) => err.code === 'CAPABILITY_UNAVAILABLE');
+    noHelper.stop();
+  } finally {
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+
+  // 旧版 helper 无卡片命令（unknown-cmd）：直连调用如实抛错（showGuideCards 负责吞掉降级）
+  const f2 = fixture();
+  try {
+    const oldBin = writeFakeHelper(f2.dir, { ...FAKE_HELPERS, 'show-permission-card': undefined }, join(f2.dir, 'log'));
+    const cuaOld = createCua({ audit: f2.audit, policy: f2.policy, helperPath: oldBin, execRunner: fakeExec() });
+    await assert.rejects(cuaOld.showPermissionCard({ kind: 'accessibility' }), (err) => err.code === 'unknown-cmd');
+    cuaOld.stop();
+  } finally {
+    rmSync(f2.dir, { recursive: true, force: true });
+  }
+});
+
+test('openPrivacyPane：accessibility/screen 各开对应系统设置面板 URL；非 macOS kind 兜底 accessibility', async () => {
+  const f = fixture();
+  const exec = fakeExec();
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: join(f.dir, 'nope'), execRunner: exec });
+  try {
+    const r1 = await cua.openPrivacyPane('accessibility');
+    assert.deepEqual(r1, { ok: true, pane: 'accessibility' });
+    const r2 = await cua.openPrivacyPane('screen');
+    assert.equal(r2.pane, 'screen');
+    const r3 = await cua.openPrivacyPane('bogus');
+    assert.equal(r3.pane, 'accessibility', '未知 kind 兜底到辅助功能面板');
+    const opens = exec.calls.filter((c) => c.cmd === 'open');
+    assert.deepEqual(opens.map((c) => c.args), [
+      ['x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'],
+      ['x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'],
+      ['x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'],
+    ]);
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('runGuidedGrant 悬浮卡片：申请后为仍缺项浮卡（带负责进程名）+ 自动开设置面板；复测/跳过都收卡；第二问提示看卡片', async () => {
+  const logs = [];
+  const stAfter = { supported: true, tier: 'A', axGranted: true, screenGranted: true, helperCompiled: true };
+  const cua = fakeCua({ st: stAfter });
+  const io = fakeIo(['enter', 'enter']);
+  const g = await runGuidedGrant({
+    cua,
+    st: { supported: true, tier: 'C', axGranted: false, screenGranted: false, helperCompiled: true, responsibleProcess: 'Ghostty' },
+    io,
+    log: (s) => logs.push(s),
+  });
+  assert.equal(g.mode, 'requested');
+  assert.deepEqual(g.cards, ['accessibility', 'screen'], '两卡都浮起并随引导收起');
+  // 卡片参数：kind 齐全、appName=复测负责进程名、寿命=默认 120
+  assert.deepEqual(cua.calls.showCard.map((c) => ({ kind: c.kind, appName: c.appName, durationSec: c.durationSec })), [
+    { kind: 'accessibility', appName: 'Ghostty', durationSec: CARD_DEFAULT_SEC },
+    { kind: 'screen', appName: 'Ghostty', durationSec: CARD_DEFAULT_SEC },
+  ]);
+  assert.deepEqual(cua.calls.openPane, ['accessibility'], '双缺时先开辅助功能面板');
+  assert.deepEqual([...cua.calls.hideCard].sort(), ['accessibility', 'screen'], '复测后两卡都收');
+  assert.ok(io.prompts[1].includes('琥珀色引导卡片') && io.prompts[1].includes('拖进列表或点 + 号'), '第二问提示看卡片带路');
+  assert.ok(logs.some((s) => s.includes('拖进系统设置列表即可授权')), '日志告知卡片已出现');
+
+  // 第二问跳过（Ctrl+C）：也要收卡（否则要干等自动淡出）
+  const cua2 = fakeCua({ st: stAfter });
+  const g2 = await runGuidedGrant({
+    cua: cua2,
+    st: { supported: true, axGranted: false, screenGranted: false, helperCompiled: true, responsibleProcess: 'Ghostty' },
+    io: fakeIo(['enter', 'skip']),
+    log: () => {},
+  });
+  assert.equal(g2.mode, 'skipped');
+  assert.deepEqual(g2.cards, ['accessibility', 'screen'], '跳过时也如实报告已浮的卡');
+  assert.deepEqual([...cua2.calls.hideCard].sort(), ['accessibility', 'screen'], '跳过路径同样收卡');
+
+  // 只缺屏幕：只浮一张 screen 卡、开屏幕录制面板
+  const cua3 = fakeCua({
+    st: stAfter,
+    permResult: { axGranted: true, axRequested: false, screenGranted: false, screenRequested: true, responsibleProcess: 'Ghostty' },
+  });
+  await runGuidedGrant({
+    cua: cua3,
+    st: { supported: true, axGranted: true, screenGranted: false, helperCompiled: true, responsibleProcess: 'Ghostty' },
+    io: fakeIo(['enter', 'enter']),
+    log: () => {},
+  });
+  assert.deepEqual(cua3.calls.showCard.map((c) => c.kind), ['screen']);
+  assert.deepEqual(cua3.calls.openPane, ['screen']);
+});
+
+test('runGuidedGrant 无卡片能力（旧 helper/方法缺失）：引导照常走完，第二问退回纯文字提示', async () => {
+  const stAfter = { supported: true, tier: 'A', axGranted: true, screenGranted: true, helperCompiled: true };
+  // 完全没有卡片/面板方法的 cua（模拟 v0.5.3 二进制：requestPermissions 在、卡片命令不在）
+  const bare = {
+    async status() { return { ...stAfter }; },
+    async requestPermissions() { return { axGranted: false, axRequested: true, screenGranted: false, screenRequested: true, responsibleProcess: 'Ghostty' }; },
+    stop() {},
+  };
+  const io = fakeIo(['enter', 'enter']);
+  const g = await runGuidedGrant({
+    cua: bare,
+    st: { supported: true, axGranted: false, screenGranted: false, helperCompiled: true, responsibleProcess: 'Ghostty' },
+    io,
+    log: () => {},
+  });
+  assert.equal(g.mode, 'requested', '可选方法缺失不影响主流程');
+  assert.deepEqual(g.cards, [], '无卡片能力 → 空列表');
+  assert.ok(io.prompts[1].includes('开好后按回车'), '退回 v0.5.3 的纯文字提示（不承诺不存在的卡片）');
+
+  // showPermissionCard 抛错（如旧 helper 回 unknown-cmd）：同样静默降级
+  const throwing = {
+    ...bare,
+    async showPermissionCard() { throw new Error('unknown-cmd'); },
+    async openPrivacyPane() { throw new Error('nope'); },
+  };
+  const g2 = await runGuidedGrant({
+    cua: throwing,
+    st: { supported: true, axGranted: false, screenGranted: false, helperCompiled: true },
+    io: fakeIo(['enter', 'enter']),
+    log: () => {},
+  });
+  assert.equal(g2.mode, 'requested');
+  assert.deepEqual(g2.cards, []);
+});
+
+test('卡片开关纯函数：missingCardKinds 顺序与取舍；showGuideCards 吞错降级并提示；hideGuideCards 幂等', async () => {
+  assert.deepEqual(missingCardKinds({ ax: true, screen: true }), ['accessibility', 'screen'], 'accessibility 在前（与卡片排布一致）');
+  assert.deepEqual(missingCardKinds({ ax: false, screen: true }), ['screen']);
+  assert.deepEqual(missingCardKinds({ ax: false, screen: false }), []);
+  assert.deepEqual(missingCardKinds(null), []);
+
+  // 全缺 + 卡片能力正常：两张都显示，log 提示一次
+  const ok = fakeCua({});
+  const logs = [];
+  const shown = await showGuideCards(ok, { ax: true, screen: true }, 'Ghostty', { log: (s) => logs.push(s) });
+  assert.deepEqual(shown, ['accessibility', 'screen']);
+  assert.deepEqual(ok.calls.showCard.map((c) => c.appName), ['Ghostty', 'Ghostty']);
+  assert.equal(logs.filter((s) => s.includes('拖进系统设置列表即可授权')).length, 1);
+
+  // 部分失败（screen 那张旧 helper 不认）：只返回成功的那张，不抛错
+  const partial = {
+    async showPermissionCard({ kind }) { if (kind === 'screen') throw new Error('unknown-cmd'); return { kind }; },
+    async hidePermissionCard() {},
+  };
+  const shown2 = await showGuideCards(partial, { ax: true, screen: true }, 'X', { log: () => {} });
+  assert.deepEqual(shown2, ['accessibility'], '失败的卡不进列表（调用方据此只收已浮的卡）');
+
+  // 完全无方法：空列表零异常
+  assert.deepEqual(await showGuideCards({}, { ax: true, screen: false }, 'X'), []);
+
+  // hideGuideCards：正常收 + 抛错吞 + 空数组安全
+  const ok2 = fakeCua({});
+  await hideGuideCards(ok2, ['accessibility', 'screen']);
+  assert.deepEqual(ok2.calls.hideCard, ['accessibility', 'screen']);
+  await hideGuideCards({ async hidePermissionCard() { throw new Error('dead'); } }, ['accessibility']);
+  await hideGuideCards(fakeCua({}), []);
 });

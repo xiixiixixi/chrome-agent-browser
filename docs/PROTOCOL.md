@@ -118,7 +118,7 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 
 | 层 | 执行体 | 能力 |
 |---|---|---|
-| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate）/ overlay-show · overlay-hide（幽魂光标叠加）/ request-permissions（系统标准权限申请） |
+| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate）/ overlay-show · overlay-hide（幽魂光标叠加）/ request-permissions（系统标准权限申请）/ show-permission-card · hide-permission-card（权限引导悬浮卡片，v0.5.4） |
 | B | osascript + System Events（零编译兜底） | 同形状的 ax-tree / element-click / type / key / app-focus / windows（较慢；无坐标能力；窗口无 CGWindowID，截图用 rect） |
 | C | 无任何授权 | windows（仅 helper 编译过时走 CGWindowList，窗口表本身无需授权）+ 截图（screencapture，需屏幕录制授权） |
 
@@ -134,11 +134,23 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
   加进辅助功能列表，未勾选），屏幕录制用 `CGPreflightScreenCaptureAccess()` → `CGRequestScreenCaptureAccess()`；
   静置 ~500ms 让弹窗出现后立即返回（不阻塞等用户操作），用户在系统设置勾选后经 `probe` 复测生效。
   引导编排见 `service/cua-guide.mjs`（cua-selftest 互动引导 / setup 非交互指引）。
+- 引导卡片（v0.5.4）：helper `show-permission-card {kind:'accessibility'|'screen', appName,
+  durationSec?(默认120,夹取5..600)}` → `{kind, autoHideSec, frame:{x,y,w,h}(屏幕左上原点), dragFrom?}`；
+  `hide-permission-card {kind}` 幂等收卡。300×116 borderless NSPanel：floating/nonactivating/
+  canJoinAllSpaces，**ignoresMouseEvents=false（本工具族唯一可交互的叠加窗——它就是给用户看
+  的引导 UI）**、isMovableByWindowBackground（拖背景=挪位置）、整卡不抢焦点。左侧琥珀图标=
+  拖拽句柄：`NSDraggingSource` 文件拖拽，拖出的就是 `responsibleAppBundleURL()`（负责进程的
+  .app bundle——TCC 记账、设置列表要加的正是它），可直接放进系统设置权限列表（等同点 + 号
+  选 App）；文案主推「点 + 号选终端」、拖拽为快捷路径。双卡（accessibility 上/screen 下）错位
+  不重叠；同 kind 重复 show=就地更新文案并保留用户拖过的位置。stdin EOF 时若卡片在屏则留守、
+  收齐再退（setup 非交互留卡，寿命封顶 600s）。服务侧 `showPermissionCard/hidePermissionCard/
+  openPrivacyPane`（引导编排见 `service/cua-guide.mjs`：申请后自动开对应设置面板+浮卡，权限
+  到手或引导中止即收卡；旧 helper 无卡片命令时静默降级为纯文字引导）。
 - tier 判定：A = helper 且 AX 已授权；B = 无 helper 但 AX 已授权；C = AX 未授权；非 macOS = unsupported。
 
 ### MCP 工具（9 个）
 
-`cua_status`（能力矩阵+人话授权指引）/ `cua_windows` / `cua_ax_tree {app?|pid?, maxDepth?}` /
+`cua_status`（能力矩阵+人话授权指引 `permissionGuide:{text,card}`，card=有无悬浮引导卡片能力）/ `cua_windows` / `cua_ax_tree {app?|pid?, maxDepth?}` /
 `cua_screenshot {windowId?|rect?, format?}` / `cua_click {app?|pid?, role?, title?} | {x, y, pid?}` /
 `cua_type {text, app?|pid?}` / `cua_key {key, modifiers?, confirmationToken?}` / `cua_app_focus {app}` /
 `cua_verify {x?|y?|windowId?}`。

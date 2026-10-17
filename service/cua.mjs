@@ -31,8 +31,11 @@
 //     policy-defaults.json 的 cuaOverlay:false 可整体关闭（关闭后零调用）；
 //   - 授权引导（v0.5.3）：requestPermissions() 走系统标准申请（弹对话框+把负责进程注册
 //     进设置列表，等用户拨开关），status() 带回 responsibleProcess（设置里要勾选的名字）
-//     与 permissionGuide（人话指引）——引导编排见 service/cua-guide.mjs
-//     （cua-selftest 互动引导 / setup 非交互指引）；
+//     与 permissionGuide（人话指引；v0.5.4 起为 {text, card}——card=有无悬浮引导卡片能力）
+//     ——引导编排见 service/cua-guide.mjs（cua-selftest 互动引导 / setup 非交互指引）；
+//   - 引导卡片（v0.5.4）：showPermissionCard/hidePermissionCard/openPrivacyPane——
+//     申请权限的同时弹「可拖进系统设置列表」的悬浮卡片（A 层 helper 的窗口能力，
+//     卡片图标句柄拖出的就是负责进程的 .app bundle），并自动打开对应设置面板；
 //   - 无 pid 的全局点击会移动真实光标（工具描述如实声明）；
 //   - 永不做锁屏/解锁/绕过认证类功能。
 
@@ -74,6 +77,15 @@ const OSA_MODS = { cmd: 'command down', ctrl: 'control down', alt: 'option down'
 
 const AX_GUIDANCE = '系统设置 → 隐私与安全性 → 辅助功能 → 勾选运行本服务的终端/应用（改完重跑 cua_status）';
 const SCREEN_GUIDANCE = '系统设置 → 隐私与安全性 → 屏幕录制 → 勾选同一项（未授权时截图可能只剩桌面壁纸）';
+
+/** 引导卡片合法 kind（与 helper 的 show/hide-permission-card 一一对应）。 */
+const CARD_KINDS = ['accessibility', 'screen'];
+
+/** 系统设置隐私面板 URL（open 子进程直开对应 section）。 */
+const PRIVACY_PANE_URL = {
+  accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+  screen: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+};
 
 // ---------- 小工具 ----------
 
@@ -595,6 +607,7 @@ export function createCua(opts = {}) {
     }
     const tier = axGranted === true ? (compiled ? 'A' : 'B') : 'C';
     const missing = missingPermissions({ axGranted, screenGranted });
+    const guideText = missing.ax || missing.screen ? permissionGuideText({ responsibleProcess, ...missing }) : null;
     const guidance = [];
     if (tier === 'C') guidance.push(`辅助功能未授权（或未知）：${AX_GUIDANCE}`);
     if (!compiled) guidance.push('未编译 A 层助手 host/cua-helper：跑一次 npm run setup 自动编译（需 swiftc）；无 swiftc 时以 B 层（osascript）运行，无坐标点击能力');
@@ -608,7 +621,8 @@ export function createCua(opts = {}) {
       axGranted,
       screenGranted,
       responsibleProcess, // TCC 记账的宿主 App 名（设置列表里要勾选的就是它；B/C 层无 helper 时为 null）
-      permissionGuide: missing.ax || missing.screen ? permissionGuideText({ responsibleProcess, ...missing }) : null, // 人话授权指引（缺权限时给）
+      // 人话授权指引（v0.5.4 起为对象）：text=两步说明；card=有无悬浮引导卡片能力（仅 A 层 helper 有窗口）
+      permissionGuide: guideText ? { text: guideText, card: compiled } : null,
       ...(screen ? { screen } : {}),
       overlay: { available: compiled, enabled: overlayEnabled() }, // 幽魂光标：仅 A 层（helper 叠加窗）
       ...(probeReason ? { probeError: probeReason } : {}),
@@ -634,6 +648,53 @@ export function createCua(opts = {}) {
       screenRequested: r.screenRequested === true,
       responsibleProcess: typeof r.responsibleProcess === 'string' && r.responsibleProcess ? r.responsibleProcess : null,
     };
+  }
+
+  /**
+   * 显示权限引导悬浮卡片（v0.5.4，A 层）：申请权限的同时在系统设置旁边浮一张可拖拽
+   * 的琥珀卡片——卡片图标句柄拖出的就是负责进程的 .app bundle，可直接放进设置列表；
+   * durationSec 秒后自动淡出（默认由引导层给 120）。失败安全：引导层吞错降级为纯文字。
+   */
+  async function showPermissionCard({ kind, appName, durationSec } = {}) {
+    requireMac();
+    const k = String(kind ?? '');
+    if (!CARD_KINDS.includes(k)) throw new CuaError('kind 需为 accessibility 或 screen', 'BAD_ARGS');
+    const h = helper();
+    if (!h) throw new CuaError('引导卡片需要 A 层助手 host/cua-helper（先跑 npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const r = await h.request('show-permission-card', {
+      kind: k,
+      appName: typeof appName === 'string' && appName ? appName : '',
+      ...(Number.isInteger(durationSec) ? { durationSec } : {}),
+    });
+    return {
+      kind: k,
+      ok: true,
+      ...(r.frame ? { frame: r.frame } : {}),
+      dragFrom: typeof r.dragFrom === 'string' && r.dragFrom ? r.dragFrom : null, // 拖拽句柄 promise 的 .app 路径（找不到时 null）
+    };
+  }
+
+  /** 隐藏对应引导卡片（幂等；引导结束/权限到手时收卡）。 */
+  async function hidePermissionCard(kind) {
+    requireMac();
+    const k = String(kind ?? '');
+    if (!CARD_KINDS.includes(k)) throw new CuaError('kind 需为 accessibility 或 screen', 'BAD_ARGS');
+    const h = helper();
+    if (!h) throw new CuaError('引导卡片需要 A 层助手 host/cua-helper（先跑 npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    await h.request('hide-permission-card', { kind: k });
+    return { kind: k, hidden: true };
+  }
+
+  /**
+   * 直接打开系统设置的对应隐私面板（accessibility / screen）。配合 requestPermissions：
+   * 弹完系统对话框后把面板开到正确 section，省掉用户自己找路径。
+   */
+  async function openPrivacyPane(kind = 'accessibility') {
+    requireMac();
+    const k = CARD_KINDS.includes(kind) ? kind : 'accessibility';
+    const r = await execRunner('open', [PRIVACY_PANE_URL[k]], { timeoutMs: 5000 });
+    if (r.code !== 0) throw new CuaError(`打开系统设置面板失败（open exit ${r.code}${r.stderr ? `: ${String(r.stderr).slice(0, 120)}` : ''}）`, 'OPEN_PANE_FAILED');
+    return { ok: true, pane: k };
   }
 
   const CAP_KEYS = ['windows', 'axTree', 'elementClick', 'xyClick', 'type', 'key', 'appFocus', 'screenshot'];
@@ -1030,6 +1091,9 @@ export function createCua(opts = {}) {
   return {
     status,
     requestPermissions,
+    showPermissionCard,
+    hidePermissionCard,
+    openPrivacyPane,
     windows,
     axTree,
     screenshot,
@@ -1070,7 +1134,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_status', {
     title: '屏幕操作能力体检',
-    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, responsibleProcess, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；responsibleProcess=系统设置里要勾选的终端/应用名，permissionGuide=人话授权指引；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。缺权限时首次使用会自动引导授权：npm run cua-selftest（互动引导）或 npm run setup（非交互）会自动向系统申请并一步步带你勾选。首次使用 cua_* 前先跑这个。',
+    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, responsibleProcess, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；responsibleProcess=系统设置里要勾选的终端/应用名，permissionGuide=人话授权指引（v0.5.4 起 {text, card}：text=两步说明，card=有无悬浮引导卡片——申请权限时屏幕上会浮一张可拖进系统设置列表的琥珀卡片）；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。缺权限时首次使用会自动引导授权：npm run cua-selftest（互动引导）或 npm run setup（非交互）会自动向系统申请并一步步带你勾选。首次使用 cua_* 前先跑这个。',
     inputSchema: {},
   }, guard(async () => textResult(await cua.status())));
 

@@ -2,9 +2,10 @@
 // cua-selftest.mjs —— 屏幕操作（CUA）交互动全清单自检：探测 →（缺权限则）授权引导 → 编译 → windows →
 // （有授权则）ax-tree + 截图 + 幽魂光标试闪，输出人话报告。
 //
-// 授权引导（v0.5.3）：缺权限时自动向系统申请（helper 的 request-permissions 弹标准
-// 系统对话框、把负责进程注册进设置列表），人话带路，用户只需在
-// 系统设置 → 隐私与安全性 里拨开关；回车推进、Ctrl+C 跳过（跳过即如实降级报告）。
+// 授权引导（v0.5.3；v0.5.4 加悬浮卡片）：缺权限时自动向系统申请（helper 的
+// request-permissions 弹标准系统对话框、把负责进程注册进设置列表），同时自动打开
+// 对应设置面板并浮起琥珀引导卡片（可拖进列表/点 + 号；helper 太旧时静默退化为纯文字），
+// 人话带路，回车推进、Ctrl+C 跳过（跳过即如实降级报告）。
 //
 // 安全默认：本自检不做任何点击/输入/按键（只读探测 + 截一小块区域 +
 // 屏幕中央闪一次叠加光标——纯可视化，点击穿透、不动任何应用与真鼠标）；
@@ -115,7 +116,7 @@ try {
           });
           if (g.mode === 'requested') {
             results.push(['授权申请（request-permissions）', null,
-              `ax 申请=${g.requested?.axRequested ? '是' : '否'}，屏幕申请=${g.requested?.screenRequested ? '是' : '否'}；复测 tier ${st.tier} → ${g.st.tier}`]);
+              `ax 申请=${g.requested?.axRequested ? '是' : '否'}，屏幕申请=${g.requested?.screenRequested ? '是' : '否'}；引导卡片 ${g.cards?.length ?? 0} 张；复测 tier ${st.tier} → ${g.st.tier}`]);
             st = g.st; // 复测后的新状态：后续门（ax-tree/截图/叠加）按它走
           }
           if (g.mode === 'skipped') {
