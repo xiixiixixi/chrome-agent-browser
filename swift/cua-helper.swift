@@ -21,11 +21,19 @@
 //                                        遍历限额：深度 12 / 每层 80 / 总 1500 节点；文本截断 120 字符。
 //                                        AX 未授权 → {ok:false, code:"not-granted"}（结构化，不崩溃）。
 //   element-click {pid, role, title?}  → 先 AXUIElement PerformAction(press)；失败兜底取元素 bounds
-//                                        中心做定向坐标点击 → {pressed} | {xyFallback, bounds, at}
-//   xy-click {x, y, pid?}              → 有 pid：CGEventPostToPid 定向投递（不动真实光标）；
-//                                        无 pid：CGEventPost 全局（会移动真实光标）
-//   type {pid?, text}                  → 键盘事件逐段输入（≤20 字符/事件，规避单事件长度限制）
-//   key {pid?, key, modifiers?}        → modifiers: cmd/ctrl/alt/shift；key 用键码映射表
+//                                        中心做坐标点击 → {pressed} | {xyFallback, bounds, at}
+//   xy-click {x, y, pid?}              → v0.5.5：进程定向鼠标注入（CGEventPostToPid）在新系统已全面失效
+//                                        （窗口服务器按真实光标 hit-testing，Chromium 系与原生应用实测均忽略）。
+//                                        有 pid：点击点最上层不是目标窗口（不前台/被遮挡）先 AXRaise+activate
+//                                        把目标置前（遮挡者记 coveredBy），再全局注入并回 fallback:"global"
+//                                        （会移动真实光标，但保证生效）；无 pid：全局注入。
+//   type {pid?, text}                  → 键盘事件逐段输入：CGEventKeyboardSetUnicodeString 直塞 UTF-16 文本
+//                                        （中文等无键码字符的唯一可靠路径），按 UTF-16 码元分段（≤20/事件，
+//                                        规避单事件长度上限——一个 emoji 常占多个码元，按字符合段会超限）
+//   key {pid?, key, modifiers?}        → modifiers: cmd/ctrl/alt/shift；key 用键码映射表。v0.5.5 起修饰键按
+//                                        真实按键序列注入：flagsChange(按下修饰键) → keyDown(带 flag) → keyUp
+//                                        → flagsChange(释放)，事件间 5ms 间隔，配合 hidSystemState 事件源，
+//                                        ⌘S/⌘N 等组合键才能稳定触发系统对话框
 //   app-focus {pid}                    → AX raise 主窗口 + NSRunningApplication activate
 //   overlay-show {x, y, kind:'arrow'|'click', durationMs?(默认700)} → {ok:true}
 //                                       幽魂光标：在 (x,y) 闪现琥珀色 AI 专属箭头（kind=click
@@ -303,7 +311,7 @@ func cmdElementClick(_ id: Any?, _ p: [String: Any]) {
         respondOk(id, ["pressed": true])
         return
     }
-    // 路径 B：取元素 bounds 中心做定向坐标点击（发给该进程，不动真实光标）
+    // 路径 B：取元素 bounds 中心做坐标点击（v0.5.5：定向鼠标不可信，postClick 内部降级全局并回执）
     guard let pos = axPointOrSize(axAttr(el, kAXPositionAttribute)),
           let size = axPointOrSize(axAttr(el, kAXSizeAttribute)), size[0] > 0, size[1] > 0 else {
         respondErr(id, "元素无 bounds，无法坐标兜底", code: "no-bounds")
@@ -311,26 +319,128 @@ func cmdElementClick(_ id: Any?, _ p: [String: Any]) {
     }
     let cx = pos[0] + size[0] / 2
     let cy = pos[1] + size[1] / 2
-    postClick(pid, cx, cy)
-    respondOk(id, ["xyFallback": true, "bounds": ["x": pos[0], "y": pos[1], "w": size[0], "h": size[1]], "at": [cx, cy]])
+    let d = postClick(pid, cx, cy)
+    var out: [String: Any] = ["xyFallback": true, "bounds": ["x": pos[0], "y": pos[1], "w": size[0], "h": size[1]], "at": [cx, cy]]
+    if d.fallbackGlobal { out["fallback"] = "global" }
+    if d.focusedFirst { out["focusedFirst"] = true }
+    if let covered = d.coveredBy { out["coveredBy"] = covered }
+    if let wid = d.windowId { out["windowId"] = wid }
+    respondOk(id, out)
 }
 
-// ---------- 事件投递 ----------
+// ---------- 事件投递（v0.5.5：hidSystemState 事件源 + 定向鼠标降级全局） ----------
 
-func eventSource() -> CGEventSource? { CGEventSource(stateID: .combinedSessionState) }
+/**
+ * 键盘/鼠标事件统一用 HID 系统状态源创建。combinedSessionState 合成的事件不带真实 HID 修饰键状态，
+ * 修饰键与按键事件之间的顺序在窗口服务器侧会错乱——⌘S/⌘N「有时不弹」的根源。
+ */
+func eventSource() -> CGEventSource? { CGEventSource(stateID: .hidSystemState) }
 
-/** 有 pid → 定向投递到该进程（不动真实光标）；无 pid → 全局（会移动真实光标）。 */
+/** 键盘事件：有 pid → 定向投递到该进程；无 pid → 全局（键盘不涉及 hit-testing，两条路都可靠）。 */
 func postEvent(_ pid: Int?, _ e: CGEvent) {
     if let pid = pid, pid > 0 { e.postToPid(pid_t(pid)) } else { e.post(tap: .cghidEventTap) }
 }
 
-func postClick(_ pid: Int?, _ x: Double, _ y: Double) {
+/** 把进程带到前台（AXRaise 主窗口 + activate）；app-focus 与定向鼠标降级共用。 */
+@discardableResult
+func focusApp(_ pid: pid_t) -> (raised: Bool, activated: Bool) {
+    var raised = false
+    let app = AXUIElementCreateApplication(pid)
+    if let raw = axAttr(app, kAXMainWindowAttribute) {
+        let win = unsafeBitCast(raw, to: AXUIElement.self) // kAXMainWindowAttribute 必为元素
+        if AXUIElementPerformAction(win, "AXRaise" as CFString) == .success { raised = true }
+    }
+    var activated = false
+    if let running = NSRunningApplication(processIdentifier: pid) {
+        activated = running.activate(options: []) // macOS 14 起 activateIgnoringOtherApps 已废弃且无效
+    }
+    return (raised, activated)
+}
+
+/** kCGMouseEventWindowUnderMousePointer(91)/…ThatCanHandleThisEvent(92)：Swift overlay 未导出，用原值。 */
+let FIELD_WIN_UNDER_POINTER = CGEventField(rawValue: 91)!
+let FIELD_WIN_CAN_HANDLE = CGEventField(rawValue: 92)!
+
+/** pid 在屏上（常规层）的窗口：优先取包含 (x,y) 的，否则第一张；返回 (windowId, bounds)。 */
+func onScreenWindow(_ pid: pid_t, _ x: Double, _ y: Double) -> (windowId: Int, bounds: CGRect)? {
+    var fallback: (Int, CGRect)?
+    for w in onScreenWindows() where w.pid == Int(pid) {
+        if w.bounds.contains(CGPoint(x: x, y: y)) { return (w.windowId, w.bounds) }
+        if fallback == nil { fallback = (w.windowId, w.bounds) }
+    }
+    return fallback
+}
+
+/** 在屏常规层窗口快照（CGWindowList 本就按前→后 z 序返回）。 */
+func onScreenWindows() -> [(windowId: Int, pid: Int, ownerName: String, bounds: CGRect)] {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+      as? [[String: Any]] else { return [] }
+    var out: [(Int, Int, String, CGRect)] = []
+    for w in list {
+        let layer = (w[kCGWindowLayer as String] as? Int) ?? -1
+        let pid = (w[kCGWindowOwnerPID as String] as? Int) ?? 0
+        guard layer == 0, pid > 0 else { continue }
+        guard let b = w[kCGWindowBounds as String] as? [String: Any] else { continue }
+        out.append((
+            (w[kCGWindowNumber as String] as? Int) ?? 0,
+            pid,
+            (w[kCGWindowOwnerName as String] as? String) ?? "",
+            CGRect(x: (b["X"] as? Double) ?? 0, y: (b["Y"] as? Double) ?? 0,
+                   width: (b["Width"] as? Double) ?? 0, height: (b["Height"] as? Double) ?? 0)
+        ))
+    }
+    return out
+}
+
+/** 一次点击的投递方式回执：targeted=真定向（仅键盘语义可保）；fallbackGlobal=走了全局降级。 */
+struct ClickDelivery {
+    var targeted = false
+    var fallbackGlobal = false
+    var focusedFirst = false
+    var windowId: Int? = nil
+    var coveredBy: String? = nil // 点击点当前最上层窗口属于别的应用（已代为 raise，仍如实回执）
+}
+
+/**
+ * 鼠标点击（v0.5.5）。实测（Chromium 系网页 + 原生应用）CGEventPostToPid 的鼠标事件在现代系统
+ * 一律不生效：窗口服务器按真实光标位置 hit-testing，进程定向投递绕过了这一步，目标应用直接忽略。
+ * 因此有 pid 时：①关联目标窗口字段（尽力而为）②点击点最上层不是目标窗口（目标不前台/被别的窗口
+ * 盖住）先 focusApp 把它带到最前——否则全局注入按屏幕坐标 hit-testing 会点在遮挡窗口上
+ * ③全局注入（唯一可靠路径，会移动真实光标）——调用方应答必须带 fallback:"global"。
+ */
+func postClick(_ pid: Int?, _ x: Double, _ y: Double) -> ClickDelivery {
+    var d = ClickDelivery()
     let src = eventSource()
     let pt = CGPoint(x: x, y: y)
     guard let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
-          let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else { return }
-    postEvent(pid, down)
-    postEvent(pid, up)
+          let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else {
+        return d
+    }
+    if let pid = pid, pid > 0 {
+        if let (wid, _) = onScreenWindow(pid_t(pid), x, y) {
+            d.windowId = wid
+            for e in [down, up] { // 关联目标窗口：部分应用的事件路由会参考（对本机实测无碍）
+                e.setIntegerValueField(FIELD_WIN_UNDER_POINTER, value: Int64(wid))
+                e.setIntegerValueField(FIELD_WIN_CAN_HANDLE, value: Int64(wid))
+            }
+        }
+        // 点击点当前最上层窗口（z 序第一）不是目标的：目标不前台、或被其他应用窗口盖住。
+        // 全局注入认屏幕坐标不认 pid——先把目标 raise 到最前，点击才落在它的窗口上。
+        let topAtPoint = onScreenWindows().first { $0.bounds.contains(pt) }
+        if let top = topAtPoint, top.pid != pid {
+            d.coveredBy = top.ownerName.isEmpty ? "pid \(top.pid)" : top.ownerName
+        }
+        if d.coveredBy != nil || NSWorkspace.shared.frontmostApplication?.processIdentifier != pid_t(pid) {
+            focusApp(pid_t(pid))
+            d.focusedFirst = true
+            usleep(250_000) // 等窗口服务器完成前台切换
+        }
+        d.fallbackGlobal = true // 进程定向已不可信，统一走全局（如实回执）
+    }
+    down.post(tap: .cghidEventTap)
+    usleep(10_000) // down/up 间隔 10ms：贴近真实点击，双击检测等时序才正常
+    up.post(tap: .cghidEventTap)
+    return d
 }
 
 func cmdXyClick(_ id: Any?, _ p: [String: Any]) {
@@ -339,9 +449,21 @@ func cmdXyClick(_ id: Any?, _ p: [String: Any]) {
         return
     }
     let pid = p["pid"] as? Int
-    postClick(pid, x, y)
-    var out: [String: Any] = ["x": x, "y": y, "targeted": (pid ?? 0) > 0]
-    if (pid ?? 0) <= 0 { out["note"] = "无 pid：全局投递（会移动真实光标）" }
+    let d = postClick(pid, x, y)
+    var out: [String: Any] = ["x": x, "y": y, "targeted": d.targeted]
+    if d.fallbackGlobal {
+        out["fallback"] = "global"
+        var note = "进程定向鼠标注入在现代系统不生效：已"
+        if let covered = d.coveredBy { note += "把被「\(covered)」遮挡的目标置前并" }
+        else if d.focusedFirst { note += "把目标带到前台并" }
+        note += "全局注入（会移动真实光标）"
+        out["note"] = note
+    } else if (pid ?? 0) <= 0 {
+        out["note"] = "无 pid：全局投递（会移动真实光标）"
+    }
+    if d.focusedFirst { out["focusedFirst"] = true }
+    if let covered = d.coveredBy { out["coveredBy"] = covered }
+    if let wid = d.windowId { out["windowId"] = wid }
     respondOk(id, out)
 }
 
@@ -358,25 +480,27 @@ func cmdType(_ id: Any?, _ p: [String: Any]) {
     }
     let pid = p["pid"] as? Int
     let src = eventSource()
-    // CGEventKeyboardSetUnicodeString 单事件建议 ≤20 字符，逐段发送
+    // 中文等非键码字符唯一可靠路径：CGEventKeyboardSetUnicodeString 把 UTF-16 文本直接塞进事件，
+    // 绕过键码翻译与输入法合成。单事件上限 20 个 UTF-16 码元——必须按码元（而非 Character）
+    // 分段：一个 emoji 常占 2+ 码元，按字符合段会静默超限丢字。
+    let units = Array(text.utf16)
     var sent = 0
-    var start = text.startIndex
-    while start < text.endIndex {
-        let end = text.index(start, offsetBy: 20, limitedBy: text.endIndex) ?? text.endIndex
-        let chunk = String(text[start..<end])
-        let utf16 = Array(chunk.utf16)
+    var i = 0
+    while i < units.count {
+        let n = min(20, units.count - i)
+        let chunk = Array(units[i..<(i + n)])
         guard let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else { break }
-        down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-        up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
+        down.keyboardSetUnicodeString(stringLength: n, unicodeString: chunk)
+        up.keyboardSetUnicodeString(stringLength: n, unicodeString: chunk)
         postEvent(pid, down)
         usleep(12000) // 12ms/段：太快部分应用会丢字
         postEvent(pid, up)
         usleep(8000)
-        sent += chunk.count
-        start = end
+        sent += n
+        i += n
     }
-    respondOk(id, ["chars": sent])
+    respondOk(id, ["chars": sent]) // 与 JS text.length 同口径（UTF-16 码元数）
 }
 
 /** 常用键 → 虚拟键码（ANSI 布局）；字母数字直接查表。 */
@@ -398,6 +522,22 @@ let MOD_FLAGS: [String: CGEventFlags] = [
     "alt": .maskAlternate, "option": .maskAlternate,
     "shift": .maskShift,
 ]
+
+/** 修饰键物理键码（flagsChange 事件要带真实键码）：cmd=0x37 shift=0x38 option=0x3A control=0x3B。 */
+let MOD_KEY_CODES: [(flag: CGEventFlags, code: CGKeyCode)] = [
+    (.maskCommand, 0x37), (.maskShift, 0x38), (.maskAlternate, 0x3A), (.maskControl, 0x3B),
+]
+
+/**
+ * 合成一次 flagsChange 事件（修饰键按下/释放）：键事件改 type 为 .flagsChanged 并携带
+ * 「该修饰键之后」的系统修饰状态，与真实键盘的报告方式一致。
+ */
+func makeFlagsChange(_ src: CGEventSource?, _ keyCode: CGKeyCode, _ keyDown: Bool, _ flags: CGEventFlags) -> CGEvent? {
+    guard let e = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: keyDown) else { return nil }
+    e.type = .flagsChanged
+    e.flags = flags
+    return e
+}
 
 func cmdKey(_ id: Any?, _ p: [String: Any]) {
     guard let key = p["key"] as? String else { respondErr(id, "key 需要键名"); return }
@@ -425,11 +565,27 @@ func cmdKey(_ id: Any?, _ p: [String: Any]) {
         respondErr(id, "无法构造键盘事件")
         return
     }
+    // v0.5.5 真实按键序列：修饰键 flagsChange 逐个按下 → keyDown → keyUp → flagsChange 逐个释放，
+    // 事件间 5ms 让系统消化顺序；keyDown/keyUp 自身也带修饰 flag（真实键盘正是如此，兜底只看
+    // 按键事件 flag 的应用）。combinedSessionState 源 + 瞬发 down/up 正是 ⌘S/⌘N「有时不弹」的根因。
+    let modFlags = MOD_KEY_CODES.filter { flags.contains($0.flag) }
+    var held: CGEventFlags = []
+    for m in modFlags {
+        held.insert(m.flag)
+        if let e = makeFlagsChange(src, m.code, true, held) { postEvent(pid, e) }
+        usleep(5000)
+    }
     down.flags = flags
-    up.flags = flags
     postEvent(pid, down)
-    usleep(15000)
+    usleep(10000)
+    up.flags = flags
     postEvent(pid, up)
+    usleep(5000)
+    for m in modFlags.reversed() {
+        held.remove(m.flag)
+        if let e = makeFlagsChange(src, m.code, false, held) { postEvent(pid, e) }
+        usleep(5000)
+    }
     respondOk(id, ["key": lowered, "keyCode": code, "modifiers": names])
 }
 
@@ -437,17 +593,8 @@ func cmdKey(_ id: Any?, _ p: [String: Any]) {
 
 func cmdAppFocus(_ id: Any?, _ p: [String: Any]) {
     guard let pid = p["pid"] as? Int, pid > 0 else { respondErr(id, "app-focus 需要 pid"); return }
-    var raised = false
-    let app = AXUIElementCreateApplication(pid_t(pid))
-    if let raw = axAttr(app, kAXMainWindowAttribute) {
-        let win = unsafeBitCast(raw, to: AXUIElement.self) // CFTypeRef → AXUIElement（kAXMainWindowAttribute 必为元素）
-        if AXUIElementPerformAction(win, "AXRaise" as CFString) == .success { raised = true }
-    }
-    var activated = false
-    if let running = NSRunningApplication(processIdentifier: pid_t(pid)) {
-        activated = running.activate(options: []) // macOS 14 起 activateIgnoringOtherApps 已废弃且无效
-    }
-    respondOk(id, ["axRaised": raised, "appActivated": activated])
+    let r = focusApp(pid_t(pid))
+    respondOk(id, ["axRaised": r.raised, "appActivated": r.activated])
 }
 
 // ---------- 幽魂光标叠加层（overlay：AI 动手位置的可见化提示；真鼠标始终不动） ----------

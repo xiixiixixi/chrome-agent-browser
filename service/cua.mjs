@@ -11,7 +11,9 @@
 // 三层执行体（tier）：
 //   A（编译版，最强）：host/cua-helper（swift/cua-helper.swift 由 setup 用 swiftc 编译，
 //     行协议 JSON）。windows=CGWindowList、AX 遍历、element-click（AXPress+坐标兜底）、
-//     xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）、type/key、app-focus。
+//     xy-click（v0.5.5：进程定向鼠标注入在新系统不生效——有 pid 时先带前台再全局注入，
+//     回 fallback:'global'；无 pid 全局）、type（UTF-16 直塞，中文/emoji 可靠）、
+//     key（真实修饰键序列）、app-focus。
 //   B（零编译兜底）：osascript + System Events——ax-tree / element-click / type / key /
 //     app-focus / windows 全走 AppleScript（较慢；无 xy 定向能力）。
 //   C（无任何授权）：仅 windows（helper 编译过时走 CGWindowList，无需授权）与截图
@@ -938,7 +940,14 @@ export function createCua(opts = {}) {
       overlayShow(x, y, 'click'); // 幽魂光标：注入前闪现（前证据已取完，不污染物理验证）
       lastClick = { x, y, atMs: clock() };
       const r = await h.request('xy-click', { x, y, ...(pid ? { pid } : {}) });
-      return { ok: true, mode: 'xy', x, y, targeted: r.targeted === true, ...(r.note ? { note: r.note } : {}) };
+      return {
+        ok: true, mode: 'xy', x, y, targeted: r.targeted === true,
+        ...(r.fallback ? { fallback: r.fallback } : {}), // v0.5.5：定向鼠标降级全局时如实回执
+        ...(r.focusedFirst ? { focusedFirst: true } : {}),
+        ...(r.coveredBy ? { coveredBy: r.coveredBy } : {}), // 点击点曾被其他应用窗口遮挡（已代为置前）
+        ...(r.windowId ? { windowId: r.windowId } : {}),
+        ...(r.note ? { note: r.note } : {}),
+      };
     }
 
     // 元素模式（AX 优先）
@@ -965,6 +974,10 @@ export function createCua(opts = {}) {
       return {
         ok: true, mode: 'element', pid: targetPid, role,
         ...(r.pressed ? { pressed: true } : { xyFallback: true, bounds: r.bounds, at: r.at }),
+        ...(r.fallback ? { fallback: r.fallback } : {}), // 坐标兜底同样可能全局降级
+        ...(r.focusedFirst ? { focusedFirst: true } : {}),
+        ...(r.coveredBy ? { coveredBy: r.coveredBy } : {}),
+        ...(r.windowId ? { windowId: r.windowId } : {}),
       };
     }
     await osa(execRunner, osaElementClickScript(targetPid, role, title ?? ''));
@@ -1174,10 +1187,10 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_click', {
     title: '点击（元素优先，坐标兜底）',
-    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree。② 坐标 {x, y, pid?}——仅 A 层；给 pid 定向投递（不动真实光标），不给 pid 全局投递（会移动真实光标，慎用）。动作会自动留「前证据」，配合 cua_verify 物理验证；点击位置闪现幽魂光标提示（叠加窗，policy 的 cuaOverlay 可关）。全审计。',
+    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree。② 坐标 {x, y, pid?}——仅 A 层；给 pid 时若目标不前台会先把目标带到前台，再全局注入（进程定向鼠标注入在现代 macOS 已不生效，结果里 fallback:"global" 如实标注；会移动真实光标）；不给 pid 直接全局注入（同样会移动真实光标，慎用）。动作会自动留「前证据」，配合 cua_verify 物理验证；点击位置闪现幽魂光标提示（叠加窗，policy 的 cuaOverlay 可关）。全审计。',
     inputSchema: {
       app: z.string().optional().describe('元素模式：目标应用名'),
-      pid: z.number().int().optional().describe('目标进程 id（元素/坐标模式均可，坐标模式=定向投递）'),
+      pid: z.number().int().optional().describe('目标进程 id（元素/坐标模式均可；坐标模式带 pid=目标置前+全局注入，见工具描述）'),
       role: z.string().optional().describe('元素模式：AX 角色（如 AXButton）'),
       title: z.string().optional().describe('元素模式：元素标题（精确匹配，同角色多个时用它区分）'),
       x: z.number().optional().describe('坐标模式：屏幕 x（像素）'),
@@ -1187,7 +1200,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_type', {
     title: '输入文本',
-    description: '向目标应用输入文本（给 app/pid 时 A 层定向投递、B 层先置前台；都不给=当前前台应用）。≤4000 字符。值脱敏入审计（记 [redacted] 与长度）。',
+    description: '向目标应用输入文本（给 app/pid 时 A 层定向投递、B 层先置前台；都不给=当前前台应用）。中文/emoji 等 Unicode 文本经 UTF-16 直塞事件，稳定可靠（不受输入法干扰）。≤4000 字符。值脱敏入审计（记 [redacted] 与长度）。',
     inputSchema: {
       text: z.string().min(1).describe('要输入的文本（≤4000 字符，更长请分段）'),
       app: z.string().optional().describe('目标应用名（可选）'),
