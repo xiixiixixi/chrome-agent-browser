@@ -1,14 +1,20 @@
 #!/usr/bin/env node
-// cua-selftest.mjs —— 屏幕操作（CUA）交互动全清单自检：探测 → 编译 → windows →
+// cua-selftest.mjs —— 屏幕操作（CUA）交互动全清单自检：探测 →（缺权限则）授权引导 → 编译 → windows →
 // （有授权则）ax-tree + 截图 + 幽魂光标试闪，输出人话报告。
 //
+// 授权引导（v0.5.3）：缺权限时自动向系统申请（helper 的 request-permissions 弹标准
+// 系统对话框、把负责进程注册进设置列表），人话带路，用户只需在
+// 系统设置 → 隐私与安全性 里拨开关；回车推进、Ctrl+C 跳过（跳过即如实降级报告）。
+//
 // 安全默认：本自检不做任何点击/输入/按键（只读探测 + 截一小块区域 +
-// 屏幕中央闪一次叠加光标——纯可视化，点击穿透、不动任何应用与真鼠标）。
+// 屏幕中央闪一次叠加光标——纯可视化，点击穿透、不动任何应用与真鼠标）；
+// 授权申请弹的是 macOS 系统自己的标准对话框，由用户决定是否授予。
 // 用法：npm run cua-selftest
 // 退出码：探测链路本身能跑通即 0（未授权/未编译等降级项如实报告，不算失败）。
 
 import process from 'node:process';
 import { compileHelper, createCua } from './service/cua.mjs';
+import { missingPermissions, permissionGuideText, runGuidedGrant, degradedNote } from './service/cua-guide.mjs';
 
 const log = (s) => console.log(s);
 const results = [];
@@ -20,8 +26,37 @@ const step = (name, fn) => {
     .catch((err) => { results.push([name, err, null]); return null; });
 };
 
+/**
+ * TTY 交互（授权引导用）：ask 等一行输入，任何输入=继续（'enter'），Ctrl+C='skip'。
+ * 非 TTY（管道/CI）返回 null → 调用方降级为非交互指引。SIGINT 监听只在等待期间挂着，
+ * 结束即拆——引导之外 Ctrl+C 恢复系统默认行为。
+ */
+function makeTtyIo() {
+  if (!process.stdin.isTTY) return null;
+  let cleanup = null;
+  return {
+    ask(prompt) {
+      return new Promise((resolve) => {
+        process.stdout.write(prompt);
+        const done = (v) => { cleanup?.(); cleanup = null; resolve(v); };
+        const onData = () => done('enter');
+        const onSigint = () => done('skip');
+        cleanup = () => {
+          process.stdin.removeListener('data', onData);
+          process.stdin.pause();
+          process.removeListener('SIGINT', onSigint);
+        };
+        process.stdin.once('data', onData);
+        process.once('SIGINT', onSigint);
+      });
+    },
+    close() { cleanup?.(); cleanup = null; },
+  };
+}
+
 log('chrome-agent-browser 屏幕操作（CUA）自检');
-log('安全说明：本自检只做只读探测与截取一小块画面，不做任何点击/输入/按键。\n');
+log('安全说明：本自检只做只读探测与截取一小块画面，不做任何点击/输入/按键；');
+log('          缺权限时会先走系统标准授权申请（弹的是 macOS 自己的对话框，由你决定）。\n');
 
 const cua = createCua({});
 try {
@@ -54,6 +89,50 @@ try {
       const st2 = await step('复测能力（编译后 tier 应提升）', () => cua.status());
       if (st2) {
         log(`复测：tier ${st.tier} → ${st2.tier}；辅助功能 ${st2.axGranted === true ? '✓' : '✗/未知'}；屏幕录制 ${st2.screenGranted === true ? '✓' : '✗/未知'}`);
+      }
+    }
+  }
+
+  // 2.5 授权引导（v0.5.3）：缺权限时自动向系统申请 + 人话带路（回车推进 / Ctrl+C 跳过）。
+  //     只在交互终端且 helper 已编译时进行（申请走 helper 的 request-permissions）；
+  //     跳过/失败/复测仍缺都如实报告，然后继续只读自检（降级项本来就如实标注）。
+  const miss = missingPermissions(st);
+  if (st.supported && (miss.ax || miss.screen)) {
+    if (!st.helperCompiled) {
+      log('');
+      log(`⚠ ${permissionGuideText({ responsibleProcess: st.responsibleProcess, ...miss })}`);
+      log('  （自动申请需 A 层助手：跑一次 npm run setup 编译后，重跑本自检即可自动弹系统申请）');
+    } else {
+      const io = makeTtyIo();
+      if (!io) {
+        log('');
+        log(`⚠ 缺权限，且当前不是交互终端（stdin 非 TTY），跳过自动申请。${permissionGuideText({ responsibleProcess: st.responsibleProcess, ...miss })}`);
+      } else {
+        try {
+          const g = await runGuidedGrant({
+            cua, st, io, log,
+            recompile: st.swiftcAvailable ? () => compileHelper({ log: () => {} }) : null,
+          });
+          if (g.mode === 'requested') {
+            results.push(['授权申请（request-permissions）', null,
+              `ax 申请=${g.requested?.axRequested ? '是' : '否'}，屏幕申请=${g.requested?.screenRequested ? '是' : '否'}；复测 tier ${st.tier} → ${g.st.tier}`]);
+            st = g.st; // 复测后的新状态：后续门（ax-tree/截图/叠加）按它走
+          }
+          if (g.mode === 'skipped') {
+            log('');
+            log(`已跳过授权引导：${degradedNote(st)}。随时重跑 npm run cua-selftest 再引导。`);
+          } else if (g.mode === 'error') {
+            log('');
+            log(`⚠ 自动申请失败：${g.error.message}`);
+            log(`  ${degradedNote(st)}；${permissionGuideText({ responsibleProcess: st.responsibleProcess, ...missingPermissions(st) })}`);
+          } else if (g.mode === 'requested' && (g.missing.ax || g.missing.screen)) {
+            const lack = [g.missing.ax && '辅助功能', g.missing.screen && '屏幕录制'].filter(Boolean).join('、');
+            log('');
+            log(`⚠ 复测仍有权限未授予（${lack}）：${degradedNote(g.st)}`);
+          }
+        } finally {
+          io.close();
+        }
       }
     }
   }

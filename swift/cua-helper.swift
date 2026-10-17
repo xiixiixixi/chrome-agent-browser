@@ -7,6 +7,15 @@
 //
 // 命令集（与 service/cua.mjs 的调用侧一一对应）：
 //   probe                              → {axGranted, screenGranted}（AXIsProcessTrusted / CGPreflightScreenCaptureAccess）
+//                                        附 responsibleProcess（TCC 记账的宿主 App 名，通常为终端——
+//                                        用户在系统设置里要勾选的就是这个名字；沿 ppid 链推断）
+//   request-permissions                → 向系统申请辅助功能与屏幕录制权限（各自仅在缺失时申请）：
+//                                        AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt=true)
+//                                        弹标准对话框并把负责进程加进辅助功能列表（未勾选）；
+//                                        CGRequestScreenCaptureAccess() 同理注册屏幕录制。
+//                                        两者立即返回（不阻塞等用户操作），静置 ~500ms 让弹窗出现后
+//                                        即报 {axGranted, axRequested, screenGranted, screenRequested,
+//                                        responsibleProcess}。用户在系统设置勾选后经 probe 复测生效。
 //   windows                            → {windows:[{windowId, ownerPid, ownerName, title, bounds:{x,y,w,h}, onScreen}]}
 //   ax-tree {pid, maxDepth?}           → {nodes:[{depth, role, title?, value?, bounds?, actions?}], truncated}
 //                                        遍历限额：深度 12 / 每层 80 / 总 1500 节点；文本截断 120 字符。
@@ -85,10 +94,74 @@ let AX_NOT_GRANTED_HINT = "辅助功能（AX）未授权：系统设置 → 隐�
 // ---------- probe ----------
 
 func cmdProbe(_ id: Any?, _ p: [String: Any]) {
-    var out: [String: Any] = ["axGranted": axTrusted(), "screenGranted": CGPreflightScreenCaptureAccess()]
+    var out: [String: Any] = ["axGranted": axTrusted(), "screenGranted": CGPreflightScreenCaptureAccess(),
+                              "responsibleProcess": responsibleProcessName()]
     let b = CGDisplayBounds(CGMainDisplayID()) // 主屏尺寸（自检把幽魂光标定位到屏幕中央用）
     out["screen"] = ["w": b.width, "h": b.height]
     respondOk(id, out)
+}
+
+// ---------- request-permissions（v0.5.3：标准 macOS 权限申请——申请，而不只是检查） ----------
+
+/** 父 pid（sysctl kinfo_proc；失败返回 -1）。 */
+func parentPid(_ pid: pid_t) -> pid_t {
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.size
+    guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return -1 }
+    return info.kp_eproc.e_ppid
+}
+
+/**
+ * 负责进程名（TCC 记账的宿主 App，从终端跑时就是终端）：沿 ppid 链向上找最近的真 App
+ * 进程（NSRunningApplication 非 nil 且带 bundleIdentifier 的才算——主线程的 NSApplication
+ * 会把本 CLI 进程也注册成「app」，但无 bundle，借此排除）；找不到回退本进程名。
+ * 申请权限时系统弹窗与设置列表里显示的就是这个名字——用户要勾选的也是它。
+ */
+func responsibleProcessName() -> String {
+    var pid = parentPid(getpid()) // 从父进程起步，跳过被 NSApplication 自注册的本进程
+    for _ in 0..<16 { // 链深兜底，防异常成环
+        if pid <= 1 { break }
+        if let app = NSRunningApplication(processIdentifier: pid),
+           let bundleId = app.bundleIdentifier, !bundleId.isEmpty,
+           let name = app.localizedName, !name.isEmpty {
+            return name
+        }
+        let ppid = parentPid(pid)
+        if ppid <= 0 { break }
+        pid = ppid
+    }
+    return ProcessInfo.processInfo.processName
+}
+
+/**
+ * 向系统申请辅助功能与屏幕录制（各自仅在缺失时申请，已授权的不重复弹窗）。
+ * 两个 API 都把「负责进程」（调用链上的宿主 App，通常是终端）注册进对应列表（未勾选状态），
+ * 并立即返回；静置 ~500ms 让系统对话框出现后即报状态，不阻塞等用户操作。
+ */
+func cmdRequestPermissions(_ id: Any?, _ p: [String: Any]) {
+    var axGranted = axTrusted()
+    var axRequested = false
+    if !axGranted {
+        // kAXTrustedCheckOptionPrompt 在 Swift 里是 Unmanaged<CFString>，取值后作字典键
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        axGranted = AXIsProcessTrustedWithOptions(opts)
+        axRequested = !axGranted // 已向系统申请（弹窗+注册未勾选项），等用户去设置里勾选
+    }
+    var screenGranted = CGPreflightScreenCaptureAccess()
+    var screenRequested = false
+    if !screenGranted {
+        screenGranted = CGRequestScreenCaptureAccess()
+        screenRequested = !screenGranted
+    }
+    usleep(500_000) // 给系统 ~500ms 弹出对话框，随后立即返回
+    respondOk(id, [
+        "axGranted": axGranted,
+        "axRequested": axRequested,
+        "screenGranted": screenGranted,
+        "screenRequested": screenRequested,
+        "responsibleProcess": responsibleProcessName(),
+    ])
 }
 
 // ---------- windows（CGWindowList：窗口清单本身无需授权；窗口标题需屏幕录制授权才可见） ----------
@@ -556,6 +629,7 @@ func handleLine(_ line: String) {
     }
     switch cmd {
     case "probe": cmdProbe(id, obj)
+    case "request-permissions": cmdRequestPermissions(id, obj)
     case "windows": cmdWindows(id, obj)
     case "ax-tree": cmdAxTree(id, obj)
     case "element-click": cmdElementClick(id, obj)

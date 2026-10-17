@@ -118,14 +118,22 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 
 | 层 | 执行体 | 能力 |
 |---|---|---|
-| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate）/ overlay-show · overlay-hide（幽魂光标叠加） |
+| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate）/ overlay-show · overlay-hide（幽魂光标叠加）/ request-permissions（系统标准权限申请） |
 | B | osascript + System Events（零编译兜底） | 同形状的 ax-tree / element-click / type / key / app-focus / windows（较慢；无坐标能力；窗口无 CGWindowID，截图用 rect） |
 | C | 无任何授权 | windows（仅 helper 编译过时走 CGWindowList，窗口表本身无需授权）+ 截图（screencapture，需屏幕录制授权） |
 
 - helper 行协议：stdin 每行一个 JSON 请求 `{id, cmd, ...参数}`，stdout 每行一个 JSON 响应
   `{id, ok:true, ...}` | `{id, ok:false, error, code?}`；常驻进程、按 id 配对、死亡自动重启。
 - 权限探测：helper `probe` → `{axGranted: AXIsProcessTrusted, screenGranted: CGPreflightScreenCaptureAccess,
-  screen:{w,h} 主屏尺寸}`；无 helper 时 AX 用 osascript 试探（不可靠的项如实报 unknown）。
+  responsibleProcess 负责进程名（TCC 记账的宿主 App，沿 ppid 链向上找最近带 bundle 的 App 推断——
+  从终端跑时即终端名，设置列表里要勾选的就是它）, screen:{w,h} 主屏尺寸}`；
+  无 helper 时 AX 用 osascript 试探（不可靠的项如实报 unknown）。
+- 权限申请（v0.5.3）：helper `request-permissions` → `{axGranted, axRequested, screenGranted,
+  screenRequested, responsibleProcess}`。各自仅在缺失时申请：AX 用
+  `AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt=true)`（弹标准对话框并把负责进程
+  加进辅助功能列表，未勾选），屏幕录制用 `CGPreflightScreenCaptureAccess()` → `CGRequestScreenCaptureAccess()`；
+  静置 ~500ms 让弹窗出现后立即返回（不阻塞等用户操作），用户在系统设置勾选后经 `probe` 复测生效。
+  引导编排见 `service/cua-guide.mjs`（cua-selftest 互动引导 / setup 非交互指引）。
 - tier 判定：A = helper 且 AX 已授权；B = 无 helper 但 AX 已授权；C = AX 未授权；非 macOS = unsupported。
 
 ### MCP 工具（9 个）

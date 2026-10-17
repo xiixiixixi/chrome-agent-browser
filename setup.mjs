@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { computeExtensionId, parseArgs as parseInstallArgs, runInstall, FAMILY_NAMES } from './installer/install.mjs';
 import { installedBrowsers } from './installer/discovery.mjs';
 import { ConnectionManager } from './service/connection.mjs';
-import { compileHelper } from './service/cua.mjs';
+import { compileHelper, createCua } from './service/cua.mjs';
+import { missingPermissions } from './service/cua-guide.mjs';
 
 // setup.mjs 位于仓库根，REPO_ROOT 就是它所在目录（此前误用 '..' 多退一级）
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -131,8 +132,33 @@ async function main() {
   const cua = compileHelper({ log: (m) => log(`   ${m}`) });
   if (cua.compiled) {
     log('   ✓ 已编译 host/cua-helper（A 层：窗口清单 / AX 元素操作 / 定向坐标点击）');
-    log('   授权两步（都在 系统设置 → 隐私与安全性）：①「辅助功能」勾选你的终端 → 支持元素点击/输入；');
-    log('   ②「屏幕录制」勾选同一项 → 支持截图。不授权也能用 B 层（osascript）与窗口清单。');
+    // v0.5.3：编译成功即自动探测权限并向系统申请（非交互：弹完对话框打印指引，不等待）
+    const cuaCtx = createCua({});
+    try {
+      const st = await cuaCtx.status();
+      const miss = missingPermissions(st);
+      if (!miss.ax && !miss.screen) {
+        log('   ✓ 辅助功能与屏幕录制权限均已授予，CUA 全功能就绪');
+      } else {
+        const name = st.responsibleProcess || '你的终端';
+        let dialogsPopped = true;
+        try {
+          await cuaCtx.requestPermissions();
+        } catch (err) {
+          dialogsPopped = false;
+          log(`   - 自动申请未完成（${err.message}），请手动到系统设置里勾选：`);
+        }
+        log('');
+        log('   ⚠ 屏幕操作（CUA）需要两个 macOS 权限');
+        log(`   ${dialogsPopped ? '系统刚才弹了授权对话框，请到' : '请到'} 系统设置→隐私与安全性 里：`);
+        if (miss.ax) log(`     ① 辅助功能 → 勾选「${name}」`);
+        if (miss.screen) log(`     ${miss.ax ? '②' : '①'} 屏幕录制 → 勾选「${name}」`);
+        log('     完成后运行 npm run cua-selftest 验证');
+        log('     （不授权也能用 B 层 osascript 与窗口清单，但没有坐标点击与截图）');
+      }
+    } finally {
+      cuaCtx.stop();
+    }
   } else if (cua.skipped) {
     log('   - 跳过：非 macOS 平台，cua_* 工具族不可用（其余功能不受影响）。');
   } else {

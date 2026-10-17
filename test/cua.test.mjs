@@ -10,8 +10,12 @@
 //   - MCP 工具族（9 个 cua_* 注册；cua_status / cua_screenshot / cua_key 经 InMemoryTransport）
 //   - 幽魂光标（v0.5.1）：overlay-show 拼装/窗口中心近似/xyFallback 落点精化；失败不阻塞动作；
 //     cuaOverlay 开关（false 零调用）；type/key 30s 提示窗口（假时钟）；叠加不入审计、不污染前证据
+//   - 授权引导（v0.5.3）：requestPermissions 协议拼装/解析（fake helper + 旧 helper unknown-cmd
+//     就地重编译重试）；status 新字段 responsibleProcess/permissionGuide（全授权时 guide=null；
+//     status 绝不触发申请——探测无副作用）；runGuidedGrant 分支（已授权/非 TTY/跳过/申请+复测/
+//     申请失败）；纯函数 missingPermissions/permissionGuideText/degradedNote
 //   - Swift 助手自检：swiftc 可用则编译到临时目录跑 probe/windows/ax-tree（含 overlay 协议错误分支）；
-//     编译失败/无 swiftc/非 macOS → SKIP（带原因，不算失败）；源码级 overlay 协议/窗口要件断言
+//     编译失败/无 swiftc/非 macOS → SKIP（带原因，不算失败）；源码级 overlay/授权申请协议要件断言
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,6 +36,9 @@ import { buildMcpServer } from '../service/mcp.mjs';
 import {
   createCua, createHelperClient, compileHelper, swiftcPath, keyCombo, SWIFT_SRC_PATH,
 } from '../service/cua.mjs';
+import {
+  missingPermissions, permissionGuideText, cTierNote, degradedNote, runGuidedGrant,
+} from '../service/cua-guide.mjs';
 
 const CUA_TOOLS = [
   'cua_status', 'cua_windows', 'cua_ax_tree', 'cua_screenshot', 'cua_click',
@@ -108,7 +115,7 @@ function fixture() {
 }
 
 const FAKE_HELPERS = {
-  probe: { axGranted: true, screenGranted: true, screen: { w: 1920, h: 1080 } },
+  probe: { axGranted: true, screenGranted: true, screen: { w: 1920, h: 1080 }, responsibleProcess: 'Ghostty' },
   windows: { windows: [{ windowId: 42, ownerPid: 4321, ownerName: 'FakeApp', title: 'Fake Win', bounds: { x: 10, y: 20, w: 800, h: 600 }, onScreen: true }] },
   'ax-tree': { nodes: [{ depth: 0, role: 'AXWindow', title: 'Fake Win' }, { depth: 1, role: 'AXButton', title: 'OK' }], truncated: false },
   'element-click': { pressed: true },
@@ -118,6 +125,7 @@ const FAKE_HELPERS = {
   'app-focus': { axRaised: true, appActivated: true },
   'overlay-show': {},
   'overlay-hide': {},
+  'request-permissions': { axGranted: false, axRequested: true, screenGranted: false, screenRequested: true, responsibleProcess: 'Ghostty' },
 };
 
 /** 组一套 tier-A cua（fake helper + fake exec）。 */
@@ -599,6 +607,7 @@ test('Swift 助手自检：编译到临时目录 → probe/windows/ax-tree（ax-
       assert.equal(probe.ok, true);
       assert.equal(typeof probe.axGranted, 'boolean');
       assert.equal(typeof probe.screenGranted, 'boolean');
+      assert.equal(typeof probe.responsibleProcess, 'string', 'probe 带负责进程名（设置里要勾选的名字）');
 
       const wins = await client.request('windows');
       assert.equal(wins.ok, true);
@@ -656,6 +665,21 @@ test('swift 源码实现 overlay 命令协议：点击穿透/不抢焦点/全屏
   assert.match(src, /setActivationPolicy\(\.accessory\)/, '无 Dock 图标的附属应用');
   assert.match(src, /DispatchQueue\.main\.async \{ app\.terminate/, 'stdin EOF → 主线程 terminate 退出');
   assert.match(src, /srgbRed: 245 \/ 255, green: 158 \/ 255, blue: 11 \/ 255/, '琥珀色与扩展角标同色系（#f59e0b）');
+});
+
+test('swift 源码实现 request-permissions 协议：系统标准申请 API + 负责进程名推断要件', () => {
+  const src = readFileSync(SWIFT_SRC_PATH, 'utf8');
+  assert.match(src, /case "request-permissions"/, '分发 request-permissions');
+  assert.match(src, /AXIsProcessTrustedWithOptions/, 'AX 申请（带 prompt 弹系统对话框）');
+  assert.match(src, /kAXTrustedCheckOptionPrompt/, '申请选项：让系统弹窗并把负责进程加进列表');
+  assert.match(src, /CGRequestScreenCaptureAccess\(\)/, '屏幕录制申请');
+  assert.match(src, /CGPreflightScreenCaptureAccess\(\)/, '屏幕录制预检（已授权不重复弹窗）');
+  assert.match(src, /"axRequested"/, '返回 axRequested（已申请待勾选）');
+  assert.match(src, /"screenRequested"/, '返回 screenRequested');
+  assert.match(src, /"responsibleProcess"/, '返回负责进程名');
+  assert.match(src, /parentPid\(getpid\(\)\)/, '负责进程名从父进程起步（跳过 NSApplication 自注册的本进程）');
+  assert.match(src, /bundleIdentifier/, '只认带 bundle 的真 App（终端）');
+  assert.match(src, /usleep\(500_000\)/, '静置 ~500ms 让系统弹窗出现后即返回（不阻塞）');
 });
 
 // ---------- 9. 幽魂光标叠加（v0.5.1） ----------
@@ -796,4 +820,223 @@ test('overlay 不入审计（纯可视化，不是动作）；前证据截图不
     t.cua.stop();
     rmSync(t.dir, { recursive: true, force: true });
   }
+});
+
+// ---------- 10. 授权引导（v0.5.3） ----------
+
+test('requestPermissions 协议：拼装单行 {cmd:"request-permissions"}，响应解析为布尔字段；无 helper 报 CAPABILITY_UNAVAILABLE', async () => {
+  const t = tierAFixture();
+  try {
+    const r = await t.cua.requestPermissions();
+    assert.deepEqual(r, {
+      axGranted: false, axRequested: true,
+      screenGranted: false, screenRequested: true,
+      responsibleProcess: 'Ghostty',
+    });
+    const logged = readHelperLog(t.logFile).find((req) => req.cmd === 'request-permissions');
+    assert.ok(logged, '请求确实发给 helper');
+    assert.deepEqual(Object.keys(logged).sort(), ['cmd', 'id'], '无多余参数');
+    assert.ok(Number.isInteger(logged.id), '请求带 id');
+  } finally {
+    t.cua.stop();
+    rmSync(t.dir, { recursive: true, force: true });
+  }
+
+  const f = fixture();
+  try {
+    const noHelper = createCua({ audit: f.audit, policy: f.policy, helperPath: join(f.dir, 'nope'), execRunner: fakeExec() });
+    await assert.rejects(noHelper.requestPermissions(), (err) => err.code === 'CAPABILITY_UNAVAILABLE' && /setup/.test(err.message));
+    noHelper.stop();
+  } finally {
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('旧版 helper 无 request-permissions（unknown-cmd）：引导层就地重编译 → cua.stop → 重试成功', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'log');
+  // 第一版 fake：没有 request-permissions；重编译后换成有该命令的新 fake（新二进制路径）
+  let bin = writeFakeHelper(f.dir, { ...FAKE_HELPERS, 'request-permissions': undefined }, logFile);
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec() });
+  const stops = [];
+  const origStop = cua.stop.bind(cua);
+  cua.stop = () => { stops.push(Date.now()); origStop(); };
+  try {
+    const recompiled = { compiled: true, path: bin };
+    const recompile = () => {
+      bin = writeFakeHelper(f.dir, FAKE_HELPERS, logFile); // 模拟 swiftc 产出了新版二进制
+      return recompiled;
+    };
+    const r = await runGuidedGrant({
+      cua,
+      st: { supported: true, axGranted: false, screenGranted: false, helperCompiled: true, responsibleProcess: 'Ghostty' },
+      io: fakeIo(['enter', 'enter']),
+      log: () => {},
+      recompile,
+    });
+    assert.equal(r.mode, 'requested', '重编译重试后引导成功');
+    assert.equal(r.requested.axRequested, true);
+    assert.equal(stops.length, 1, '重编译后必须 stop 旧进程（下次请求从新二进制拉起）');
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('status 新字段：responsibleProcess 透传；缺权限时 permissionGuide 含面板路径与勾选名；全授权时 guide=null', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'log');
+  const bin = writeFakeHelper(f.dir, {
+    ...FAKE_HELPERS,
+    probe: { axGranted: false, screenGranted: false, responsibleProcess: 'Ghostty', screen: { w: 1920, h: 1080 } },
+  }, logFile);
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec() });
+  try {
+    const st = await cua.status();
+    assert.equal(st.tier, 'C', 'AX 未授权 → C 层');
+    assert.equal(st.responsibleProcess, 'Ghostty');
+    assert.ok(st.permissionGuide.includes('系统设置'), '指引含面板路径');
+    assert.ok(st.permissionGuide.includes('辅助功能'));
+    assert.ok(st.permissionGuide.includes('屏幕录制'));
+    assert.ok(st.permissionGuide.includes('Ghostty'), '指引含要勾选的名字');
+    // status 是纯探测：绝不能触发申请（request-permissions 不入 helper 日志）
+    assert.equal(readHelperLog(logFile).filter((req) => req.cmd === 'request-permissions').length, 0, 'status 不得触发权限申请');
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+
+  // 全授权：permissionGuide=null；responsibleProcess 正常透传
+  const t = tierAFixture();
+  try {
+    const st = await t.cua.status();
+    assert.equal(st.responsibleProcess, 'Ghostty');
+    assert.equal(st.permissionGuide, null, '全授权时无需指引');
+    assert.equal(readHelperLog(t.logFile).filter((req) => req.cmd === 'request-permissions').length, 0);
+  } finally {
+    t.cua.stop();
+    rmSync(t.dir, { recursive: true, force: true });
+  }
+
+  // B 层（无 helper）：responsibleProcess=null；AX 已授权但屏幕未知 → 指引只提屏幕录制
+  const f2 = fixture();
+  const cuaB = createCua({ audit: f2.audit, policy: f2.policy, helperPath: join(f2.dir, 'nope'), execRunner: fakeExec({ osaOut: { frontmost: '555\n', __default: '' } }) });
+  try {
+    const stB = await cuaB.status();
+    assert.equal(stB.tier, 'B');
+    assert.equal(stB.responsibleProcess, null, '无 helper 时拿不到负责进程名（如实）');
+    assert.ok(stB.permissionGuide.includes('屏幕录制'));
+    assert.ok(!stB.permissionGuide.includes('辅助功能'), 'AX 已授权就不在指引里重复');
+  } finally {
+    cuaB.stop();
+    rmSync(f2.dir, { recursive: true, force: true });
+  }
+});
+
+/** fake io：按序回放应答，记录全部提示文案。 */
+function fakeIo(replies) {
+  const prompts = [];
+  let i = 0;
+  return {
+    prompts,
+    async ask(prompt) {
+      prompts.push(prompt);
+      const r = replies[Math.min(i, replies.length - 1)];
+      i += 1;
+      return r;
+    },
+  };
+}
+
+test('runGuidedGrant 分支：已授权直通（零交互零申请）；无 io=非交互；用户跳过不申请', async () => {
+  // 已授权：不问不申请
+  let requested = 0;
+  const full = { supported: true, axGranted: true, screenGranted: true, helperCompiled: true, responsibleProcess: 'Ghostty' };
+  const io0 = fakeIo([]);
+  const ok = await runGuidedGrant({ cua: fakeCua({ st: full, onRequest: () => { requested += 1; } }), st: full, io: io0, log: () => {} });
+  assert.equal(ok.mode, 'already-granted');
+  assert.equal(io0.prompts.length, 0, '已授权不打扰');
+  assert.equal(requested, 0);
+
+  // 非 TTY（io=null）：返回 no-tty 供调用方降级
+  const no = await runGuidedGrant({ cua: fakeCua(), st: { axGranted: false, screenGranted: false }, io: null, log: () => {} });
+  assert.equal(no.mode, 'no-tty');
+  assert.deepEqual(no.missing, { ax: true, screen: true });
+
+  // 第一问就跳过（Ctrl+C）：绝不向系统申请
+  const ioSkip = fakeIo(['skip']);
+  const skipped = await runGuidedGrant({ cua: fakeCua({ onRequest: () => { requested += 1; } }), st: { axGranted: false, screenGranted: false, responsibleProcess: 'Ghostty' }, io: ioSkip, log: () => {} });
+  assert.equal(skipped.mode, 'skipped');
+  assert.equal(ioSkip.prompts.length, 1, '第一问跳过，不再问第二问');
+  assert.equal(requested, 0, '跳过时不调 request-permissions');
+});
+
+test('runGuidedGrant 正常引导：两问推进、申请一次、复测 status 返回新状态与仍缺项', async () => {
+  const logs = [];
+  const stAfter = { supported: true, tier: 'A', axGranted: true, screenGranted: false, helperCompiled: true };
+  const cua = fakeCua({ st: stAfter });
+  const io = fakeIo(['enter', 'enter']);
+  const g = await runGuidedGrant({
+    cua,
+    st: { supported: true, tier: 'C', axGranted: false, screenGranted: false, helperCompiled: true, responsibleProcess: 'Ghostty' },
+    io,
+    log: (s) => logs.push(s),
+  });
+  assert.equal(g.mode, 'requested');
+  assert.deepEqual(g.st, stAfter, '返回复测后的新 status');
+  assert.deepEqual(g.missing, { ax: false, screen: true }, 'AX 已补齐、屏幕仍缺');
+  assert.equal(cua.calls.requestPermissions, 1);
+  assert.equal(cua.calls.status, 1, '复测一次 probe');
+  assert.equal(io.prompts.length, 2, '两问：开始申请 / 开好后验证');
+  const text = logs.join('\n');
+  assert.ok(text.includes('第 1 步') && text.includes('辅助功能'));
+  assert.ok(text.includes('第 2 步') && text.includes('屏幕录制'));
+  assert.ok(text.includes('Ghostty'), '引导里给要勾选的名字');
+  assert.ok(io.prompts[0].includes('按回车开始申请'), '第一问=开始申请');
+  assert.ok(io.prompts[1].includes('开好后按回车'), '第二问=开好后验证');
+
+  // 申请抛错（如 helper 消失）：mode=error 带原错误，不崩
+  const bad = await runGuidedGrant({
+    cua: fakeCua({ failWith: new Error('helper died') }),
+    st: { axGranted: false, screenGranted: false },
+    io: fakeIo(['enter']),
+    log: () => {},
+  });
+  assert.equal(bad.mode, 'error');
+  assert.match(bad.error.message, /helper died/);
+});
+
+/** fake cua：只实现引导所需的 status/requestPermissions/stop，调用计数进 calls。 */
+function fakeCua({ st = {}, failWith = null } = {}) {
+  const calls = { status: 0, requestPermissions: 0 };
+  return {
+    calls,
+    async status() { calls.status += 1; return { ...st }; },
+    async requestPermissions() {
+      calls.requestPermissions += 1;
+      if (failWith) throw failWith;
+      return { axGranted: false, axRequested: true, screenGranted: false, screenRequested: true, responsibleProcess: 'Ghostty' };
+    },
+    stop() {},
+  };
+}
+
+test('引导纯函数：missingPermissions/permissionGuideText/degradedNote 的组合与文案', () => {
+  assert.deepEqual(missingPermissions({ axGranted: true, screenGranted: true }), { ax: false, screen: false });
+  assert.deepEqual(missingPermissions({}), { ax: true, screen: true }, '未知也算缺（引导一步到位）');
+  assert.deepEqual(missingPermissions(null), { ax: true, screen: true });
+
+  const both = permissionGuideText({ responsibleProcess: 'Ghostty', ax: true, screen: true });
+  assert.ok(both.includes('①「辅助功能」勾选「Ghostty」'));
+  assert.ok(both.includes('②「屏幕录制」勾选「Ghostty」'));
+  assert.ok(both.includes('cua-selftest'), '指引提示可自动申请的入口');
+
+  const screenOnly = permissionGuideText({ responsibleProcess: null, ax: false, screen: true });
+  assert.ok(screenOnly.startsWith('系统设置 → 隐私与安全性 → ①「屏幕录制」'), '只缺屏幕时只列屏幕，序号自洽');
+  assert.ok(screenOnly.includes('运行本程序的终端'), '无名时给兜底说法');
+
+  assert.ok(cTierNote().includes('C 层'), '跳过时诚实报 C 层限制');
+  assert.ok(degradedNote({ axGranted: false, screenGranted: false }).includes('C 层'), 'AX 缺 → C 层说明');
+  assert.ok(degradedNote({ axGranted: true, screenGranted: false }).includes('屏幕录制'), '只缺屏幕 → 截图降级说明（不误报 C 层）');
+  assert.ok(!degradedNote({ axGranted: true, screenGranted: false }).includes('C 层'));
 });

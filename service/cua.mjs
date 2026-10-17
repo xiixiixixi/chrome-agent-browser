@@ -29,6 +29,10 @@
 //     type/key 在最近一次点击 30 秒内于原地显示箭头提示「在原地输入」；
 //     叠加失败绝不影响真实动作，本身不记账（只是可视化，不是动作）；
 //     policy-defaults.json 的 cuaOverlay:false 可整体关闭（关闭后零调用）；
+//   - 授权引导（v0.5.3）：requestPermissions() 走系统标准申请（弹对话框+把负责进程注册
+//     进设置列表，等用户拨开关），status() 带回 responsibleProcess（设置里要勾选的名字）
+//     与 permissionGuide（人话指引）——引导编排见 service/cua-guide.mjs
+//     （cua-selftest 互动引导 / setup 非交互指引）；
 //   - 无 pid 的全局点击会移动真实光标（工具描述如实声明）；
 //   - 永不做锁屏/解锁/绕过认证类功能。
 
@@ -39,6 +43,8 @@ import process from 'node:process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+
+import { missingPermissions, permissionGuideText } from './cua-guide.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const SWIFT_SRC_PATH = join(ROOT, 'swift', 'cua-helper.swift');
@@ -549,6 +555,7 @@ export function createCua(opts = {}) {
         axGranted: r.axGranted === true,
         screenGranted: r.screenGranted === true,
         ...(r.screen?.w && r.screen?.h ? { screen: { w: r.screen.w, h: r.screen.h } } : {}), // 主屏尺寸（自检定位叠加用）
+        ...(typeof r.responsibleProcess === 'string' && r.responsibleProcess ? { responsibleProcess: r.responsibleProcess } : {}), // 设置里要勾选的宿主 App 名
       };
     } catch (err) {
       return { axGranted: null, screenGranted: null, reason: err.message };
@@ -564,6 +571,7 @@ export function createCua(opts = {}) {
         supported: false, tier: 'unsupported', platform: process.platform,
         helperCompiled: false, swiftcAvailable: false,
         axGranted: null, screenGranted: null, screen: null,
+        responsibleProcess: null, permissionGuide: null,
         overlay: { available: false, enabled: overlayEnabled() },
         capabilities: emptyCaps(), guidance: ['屏幕操作（CUA）仅支持 macOS，本平台不可用'],
       };
@@ -572,18 +580,21 @@ export function createCua(opts = {}) {
     let axGranted = null;
     let screenGranted = null;
     let screen = null;
+    let responsibleProcess = null;
     let probeReason = null;
     if (compiled) {
       const p = await probeViaHelper();
       axGranted = p?.axGranted ?? null;
       screenGranted = p?.screenGranted ?? null;
       screen = p?.screen ?? null;
+      responsibleProcess = p?.responsibleProcess ?? null;
       probeReason = p?.reason ?? null;
     } else {
       axGranted = await probeAxViaOsa();
       screenGranted = null; // 无 helper 时无法可靠预检屏幕录制授权（截图按需试）
     }
     const tier = axGranted === true ? (compiled ? 'A' : 'B') : 'C';
+    const missing = missingPermissions({ axGranted, screenGranted });
     const guidance = [];
     if (tier === 'C') guidance.push(`辅助功能未授权（或未知）：${AX_GUIDANCE}`);
     if (!compiled) guidance.push('未编译 A 层助手 host/cua-helper：跑一次 npm run setup 自动编译（需 swiftc）；无 swiftc 时以 B 层（osascript）运行，无坐标点击能力');
@@ -596,11 +607,32 @@ export function createCua(opts = {}) {
       swiftcAvailable: swiftcPath() !== null,
       axGranted,
       screenGranted,
+      responsibleProcess, // TCC 记账的宿主 App 名（设置列表里要勾选的就是它；B/C 层无 helper 时为 null）
+      permissionGuide: missing.ax || missing.screen ? permissionGuideText({ responsibleProcess, ...missing }) : null, // 人话授权指引（缺权限时给）
       ...(screen ? { screen } : {}),
       overlay: { available: compiled, enabled: overlayEnabled() }, // 幽魂光标：仅 A 层（helper 叠加窗）
       ...(probeReason ? { probeError: probeReason } : {}),
       capabilities: capsFor(tier, compiled),
       guidance,
+    };
+  }
+
+  /**
+   * 向系统申请辅助功能与屏幕录制权限（v0.5.3）：helper 弹标准系统对话框，并把负责进程
+   * （宿主终端/应用）注册进设置列表（未勾选）；立即返回，不阻塞等用户操作。
+   * 用户在系统设置勾选后经 status()/probe 复测生效。引导编排见 service/cua-guide.mjs。
+   */
+  async function requestPermissions() {
+    requireMac();
+    const h = helper();
+    if (!h) throw new CuaError('权限申请需要 A 层助手 host/cua-helper（先跑 npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const r = await h.request('request-permissions');
+    return {
+      axGranted: r.axGranted === true,
+      axRequested: r.axRequested === true,
+      screenGranted: r.screenGranted === true,
+      screenRequested: r.screenRequested === true,
+      responsibleProcess: typeof r.responsibleProcess === 'string' && r.responsibleProcess ? r.responsibleProcess : null,
     };
   }
 
@@ -997,6 +1029,7 @@ export function createCua(opts = {}) {
 
   return {
     status,
+    requestPermissions,
     windows,
     axTree,
     screenshot,
@@ -1037,7 +1070,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_status', {
     title: '屏幕操作能力体检',
-    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。首次使用 cua_* 前先跑这个。',
+    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, responsibleProcess, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；responsibleProcess=系统设置里要勾选的终端/应用名，permissionGuide=人话授权指引；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。缺权限时首次使用会自动引导授权：npm run cua-selftest（互动引导）或 npm run setup（非交互）会自动向系统申请并一步步带你勾选。首次使用 cua_* 前先跑这个。',
     inputSchema: {},
   }, guard(async () => textResult(await cua.status())));
 

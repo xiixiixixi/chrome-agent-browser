@@ -131,12 +131,15 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
   点击带一圈扩散涟漪，约 0.7 秒后淡出），输入则原地提示箭头——让你看得见 AI 动手在哪。
   叠加窗实现：**点击穿透、不抢焦点、真鼠标不动、无新系统权限**；叠加失败绝不影响真实动作，
   也不入审计（纯可视化）。`service/policy-defaults.json` 的 `"cuaOverlay": false` 可整体关闭。
-- `cua_status` 随时报告 `{tier, axGranted, screenGranted, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}`；
+- `cua_status` 随时报告 `{tier, axGranted, screenGranted, responsibleProcess, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}`；
   `npm run cua-selftest` 是只读的交互动全清单自检（**不做任何点击**，含一次屏幕中央幽魂光标试闪，安全默认）。
 
 ### 两条授权怎么开（人话）
 
-都在 **系统设置 → 隐私与安全性**：
+首次使用会自动引导：`npm run cua-selftest`（互动，缺权限时自动弹系统申请并一步步带你勾选）
+或 `npm run setup`（非交互，编译完助手即自动申请并打印指引）。系统弹的是 macOS 标准授权对话框，
+本工具只负责把「负责进程」（通常是你的终端）注册进设置列表，开关始终在你手里。手动开也在
+**系统设置 → 隐私与安全性**：
 
 1. **辅助功能**：勾选你运行 MCP 客户端的那个终端/应用 → 元素读取/点击/输入可用（A/B 层）。
 2. **屏幕录制**：勾选同一项 → 截图可用；未授权时截图可能只剩桌面壁纸、窗口标题缺失（系统隐私裁剪，工具会如实报告）。
