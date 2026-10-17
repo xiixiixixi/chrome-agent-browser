@@ -30,6 +30,7 @@ const ALL_TOOLS = [
   'ab_list_browsers', 'ab_status', 'ab_visibility', 'ab_viewport', 'ab_open_tabs', 'ab_new_tab', 'ab_tab_info', 'ab_navigate',
   'ab_screenshot', 'ab_screencast', 'ab_ax_state', 'ab_claim_tab', 'ab_cdp', 'ab_download_open', 'ab_read_urls',
   'ab_confirm', 'ab_webmcp', 'ab_audit', 'ab_login', 'ab_credentials', 'browser_eval',
+  'cua_status', 'cua_windows', 'cua_ax_tree', 'cua_screenshot', 'cua_click', 'cua_type', 'cua_key', 'cua_app_focus', 'cua_verify',
 ];
 
 /** 起 MCP 栈：service 组装（同 service.test.mjs，简化）+ MCP server/client 对连 + 伪扩展。 */
@@ -78,7 +79,7 @@ async function startMcpStack(mockOpts = {}) {
   return { manager, policy, api, audit, server, client, mock, call, callJson, close };
 }
 
-test('tools/list 包含全部工具（ab_* + browser_eval）', async () => {
+test('tools/list 包含全部工具（ab_* + browser_eval + cua_*）', async () => {
   const s = await startMcpStack();
   try {
     const res = await s.client.listTools();

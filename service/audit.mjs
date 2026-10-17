@@ -13,7 +13,8 @@
 //   - paramsLite：只留关键参数，值脱敏——locator_action 的 value（fill/press 输入，
 //     可能含密码）与 js dialog 的 promptText 一律记 "[redacted]" 并置 redacted:true；
 //     tab_cdp_call 的 params 只记键名列表（paramKeys）；webmcp_invoke_tool 只记工具名；
-//     download_open 只记 downloadId。
+//     download_open 只记 downloadId；cua_* 屏幕操作走专用 recordCua（cmd=cua_<tool>，
+//     只记目标摘要——xy 点击记坐标、type 记 [redacted] 与长度、key 记键名）。
 //   - policy.approve(token) 成功时记一条 {cmd:"policy_approve", paramsLite:{description}}。
 //
 // 存储：<包根>/audit/audit-YYYYMMDD.jsonl（追加写）；单文件超 maxFileBytes（默认 5MB）
@@ -198,6 +199,36 @@ export function createAudit(opts = {}) {
         sus.paramsLite = { from: truncStr(origin ?? '', 300), to: truncStr(landedOrigin ?? '', 300) };
         audit._appendLine(JSON.stringify(sus));
       }
+    },
+
+    /**
+     * cua_* 屏幕操作动作留痕（v0.5.0）：cmd 记 `cua_<tool>`，paramsLite 只留目标摘要——
+     * xy 点击记坐标；type 只记长度与 [redacted]（输入可能含密码/私密内容）；key 记键名与
+     * 修饰键（键名不是秘密，审计要能回答「按过什么键」）。读类（status/windows/ax_tree/
+     * screenshot/verify）不留痕，与浏览器命令只记副作用的原则一致。
+     */
+    recordCua({ tool, mode, app, pid, role, title, x, y, text, key, modifiers }) {
+      if (audit.disabled || typeof tool !== 'string' || !tool) return;
+      const lite = {};
+      let redacted = false;
+      if (mode) lite.mode = mode;
+      if (app) lite.app = truncStr(app, 120);
+      if (Number.isInteger(pid) && pid > 0) lite.pid = pid;
+      if (role) lite.role = truncStr(role, 60);
+      if (title) lite.title = truncStr(title, 120);
+      if (Number.isFinite(x) && Number.isFinite(y)) { lite.x = x; lite.y = y; }
+      if (text !== undefined) {
+        lite.chars = typeof text === 'string' ? text.length : 0;
+        lite.text = REDACTED;
+        redacted = true;
+      }
+      if (key) {
+        lite.key = truncStr(key, 30);
+        if (Array.isArray(modifiers) && modifiers.length) lite.modifiers = modifiers.map((m) => truncStr(m, 10));
+      }
+      const entry = { ts: new Date().toISOString(), cmd: `cua_${tool}`, paramsLite: lite };
+      if (redacted) entry.redacted = true;
+      audit._appendLine(JSON.stringify(entry));
     },
 
     /**

@@ -1,6 +1,6 @@
 {
   "name": "chrome-agent-browser",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Let MCP agents drive your real Chromium-family browser (with your logged-in sessions): extension + native host + local service, one-command setup",
   "type": "module",
   "engines": {
@@ -14,9 +14,10 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check host/host.mjs && node --check service/service.mjs && node --check installer/install.mjs && node --check service/locator.mjs && node --check service/api.mjs && node --check service/mcp.mjs && node --check service/audit.mjs && node --check service/login.mjs && node --check service/credentials.mjs && node --check service/totp.mjs && node --check credential.mjs",
+    "check": "node --check host/host.mjs && node --check service/service.mjs && node --check installer/install.mjs && node --check service/locator.mjs && node --check service/api.mjs && node --check service/mcp.mjs && node --check service/audit.mjs && node --check service/cua.mjs && node --check cua-selftest.mjs && node --check service/login.mjs && node --check service/credentials.mjs && node --check service/totp.mjs && node --check credential.mjs",
     "e2e": "node test/e2e/run-e2e.mjs",
     "selftest": "node service/service.mjs --selftest && node service/mcp-entry.mjs --help || true",
+    "cua-selftest": "node cua-selftest.mjs",
     "setup": "node setup.mjs",
     "uninstall": "node uninstall.mjs",
     "doctor": "node doctor.mjs",
@@ -34,12 +35,14 @@
     "installer/",
     "service/",
     "shared/",
+    "swift/",
     "docs/PROTOCOL.md",
     "docs/recipes.md",
     "setup.mjs",
     "uninstall.mjs",
     "doctor.mjs",
-    "credential.mjs"
+    "credential.mjs",
+    "cua-selftest.mjs"
   ],
   "repository": {
     "type": "git",

@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { computeExtensionId, parseArgs as parseInstallArgs, runInstall, FAMILY_NAMES } from './installer/install.mjs';
 import { installedBrowsers } from './installer/discovery.mjs';
 import { ConnectionManager } from './service/connection.mjs';
+import { compileHelper } from './service/cua.mjs';
 
 // setup.mjs 位于仓库根，REPO_ROOT 就是它所在目录（此前误用 '..' 多退一级）
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -123,6 +124,22 @@ async function main() {
   log(JSON.stringify({ mcpServers: { 'chrome-agent-browser': { command: 'chrome-agent-browser-mcp' } } }));
   log('源码（git clone）用户：');
   log(JSON.stringify({ mcpServers: { 'chrome-agent-browser': { command: 'node', args: [entry] } } }));
+
+  // 8. 屏幕操作（CUA）助手：可选增强，编译失败不算安装失败（B 层 osascript 兜底）
+  log('');
+  log('⑦ 屏幕操作助手（cua_* 工具，可选增强）：');
+  const cua = compileHelper({ log: (m) => log(`   ${m}`) });
+  if (cua.compiled) {
+    log('   ✓ 已编译 host/cua-helper（A 层：窗口清单 / AX 元素操作 / 定向坐标点击）');
+    log('   授权两步（都在 系统设置 → 隐私与安全性）：①「辅助功能」勾选你的终端 → 支持元素点击/输入；');
+    log('   ②「屏幕录制」勾选同一项 → 支持截图。不授权也能用 B 层（osascript）与窗口清单。');
+  } else if (cua.skipped) {
+    log('   - 跳过：非 macOS 平台，cua_* 工具族不可用（其余功能不受影响）。');
+  } else {
+    log(`   - 未编译（${cua.reason}）。cua_* 仍可用 B 层（osascript：元素读/点击/输入），只是没有坐标点击。`);
+    log('     装好 Xcode 或跑 xcode-select --install 后重跑 setup 即可编译。');
+  }
+
   log('');
   log(ok ? '安装完成 🎉 日常使用：MCP 客户端按上面的配置自动拉起服务即可。' : '安装文件已就位，完成第④步后即用。');
   log('卸载：chrome-agent-browser-uninstall（npm 安装）或 npm run uninstall（源码）');

@@ -2,5 +2,6 @@
   "blockedUrlPatterns": ["chrome://settings/*", "chrome://extensions/*", "about:*"],
   "confirmActions": ["download_open", "webmcp_invoke"],
   "confirmCdp": ["Network.clearBrowserCookies", "Page.crash", "Network.setRequestInterception", "Fetch.enable"],
+  "confirmCuaKeys": ["cmd+q", "cmd+w"],
   "maxTabsPerSession": 20
 }

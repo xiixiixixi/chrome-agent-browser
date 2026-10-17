@@ -30,7 +30,7 @@ for (const family of FAMILY_NAMES) {
     removed += 1;
   }
 }
-for (const f of ['chrome-agent-browser-host', 'chrome-agent-browser-host.cmd', 'host-config.json']) {
+for (const f of ['chrome-agent-browser-host', 'chrome-agent-browser-host.cmd', 'host-config.json', 'cua-helper']) {
   const p = path.join(REPO_ROOT, 'host', f);
   if (existsSync(p)) { console.log(`${dryRun ? '[dry-run] 将删除' : '已删除'} ${p}`); if (!dryRun) rmSync(p, { force: true }); }
 }

@@ -108,3 +108,51 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 
 - 高危动作（转账/发送/删除/下载执行/CDP 危险面）由 service 的 policy 模块拦截 → `POLICY_BLOCKED`，data 里带需要的人类确认句柄。
 - MCP 面的确认通过 MCP elicitation（不支持时降级为：返回待确认描述，由调用方人工批准后带 confirmation token 重试）。
+
+## 6b. 屏幕操作工具族（cua_*，v0.5.0）
+
+`cua_*` 是浏览器链路之外的**屏幕级**操控面（任何应用），与 MCP 服务同进程
+（`service/cua.mjs`，注册于 `service/mcp.mjs`），不经过 extension→host→service 线缆。
+
+### 执行三层（逐级探测，优雅降级；cua_status 如实报告 tier）
+
+| 层 | 执行体 | 能力 |
+|---|---|---|
+| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate） |
+| B | osascript + System Events（零编译兜底） | 同形状的 ax-tree / element-click / type / key / app-focus / windows（较慢；无坐标能力；窗口无 CGWindowID，截图用 rect） |
+| C | 无任何授权 | windows（仅 helper 编译过时走 CGWindowList，窗口表本身无需授权）+ 截图（screencapture，需屏幕录制授权） |
+
+- helper 行协议：stdin 每行一个 JSON 请求 `{id, cmd, ...参数}`，stdout 每行一个 JSON 响应
+  `{id, ok:true, ...}` | `{id, ok:false, error, code?}`；常驻进程、按 id 配对、死亡自动重启。
+- 权限探测：helper `probe` → `{axGranted: AXIsProcessTrusted, screenGranted: CGPreflightScreenCaptureAccess}`；
+  无 helper 时 AX 用 osascript 试探（不可靠的项如实报 unknown）。
+- tier 判定：A = helper 且 AX 已授权；B = 无 helper 但 AX 已授权；C = AX 未授权；非 macOS = unsupported。
+
+### MCP 工具（9 个）
+
+`cua_status`（能力矩阵+人话授权指引）/ `cua_windows` / `cua_ax_tree {app?|pid?, maxDepth?}` /
+`cua_screenshot {windowId?|rect?, format?}` / `cua_click {app?|pid?, role?, title?} | {x, y, pid?}` /
+`cua_type {text, app?|pid?}` / `cua_key {key, modifiers?, confirmationToken?}` / `cua_app_focus {app}` /
+`cua_verify {x?|y?|windowId?}`。
+
+### cua_verify 的物理验证契约（防幻觉）
+
+每个动作（click/type/key/app_focus）执行前，服务自动对动作目标（窗口/坐标周边 480×320/前台窗口）
+截一张 **JPEG 前证据**（截图失败降级为 `{kind:'none', reason}`，不阻塞动作）；`cua_verify` 再取
+**后证据**，连同上一动作描述成对返回 `{action, before, after, note}`。note 明确告知调用方：
+**声称已点击不算数，必须核对两份证据**。证据只保留最近一次动作（内存，不落盘）。
+
+### 审计与策略
+
+- 审计：`audit.recordCua` 写 `cua_click` / `cua_type` / `cua_key` / `cua_app_focus` 四类条目
+  （读类不入档）；xy 点击记坐标，type 记 `[redacted]` + 长度，key 记键名与修饰键。
+- 策略：policy kind `cua_action`——默认 `cua_key` 的 `cmd+q` / `cmd+w`（`confirmCuaKeys` 可配）
+  走确认门（`POLICY_BLOCKED` + 一次性 token，`ab_confirm` 批准后带 `confirmationToken` 重试），
+  其余动作直行；未知 kind 仍 fail-closed。
+- 截图统一走 `screencapture` 子进程（`-x` 静默；窗口 `-l<windowId>`；区域 `-Rx,y,w,h`；临时文件读回即删）。
+
+### 永不做的
+
+锁屏/解锁/绕过认证类能力（helper 二进制中不存在对应命令）；幻影光标/演示层。
+无 pid 的全局坐标点击会移动真实光标——工具描述如实声明，这是唯一会动用户光标的操作。
+

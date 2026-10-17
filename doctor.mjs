@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 import { installedBrowsers, checkNativeHostManifest } from './installer/discovery.mjs';
 import { FAMILY_NAMES } from './installer/install.mjs';
+import { createCua, swiftcPath } from './service/cua.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const items = [];
@@ -63,6 +64,38 @@ if (port) {
   check(`端口 ${port} 有服务在听`, () => listening
     ? { ok: true, detail: '服务在线（MCP 客户端会话或独立服务进程）' }
     : { ok: false, detail: '当前没有服务进程。判断：你的 AI 客户端 MCP 会话正开着 → 这就是"空列表"的根因，重启会话（或 chrome-agent-browser-mcp / npm run start 手动起服务）；没开会话 → 此项正常（服务按需启动，无需常驻）' });
+}
+
+// ---- 屏幕操作（CUA）能力：helper 编译状态 + AX/屏幕录制授权探测 ----
+// 可选功能：未编译不算失败（B/C 层如实标注并给指引）；编译过但授权缺失才算可修复的 ✗。
+const cuaInfo = await (async () => {
+  try {
+    const cua = createCua({});
+    try {
+      return { status: await cua.status() };
+    } finally {
+      cua.stop(); // 结束可能拉起的常驻 helper 探测进程
+    }
+  } catch (err) {
+    return { error: err.message };
+  }
+})();
+if (cuaInfo.error) {
+  check('屏幕操作助手（CUA）', () => ({ ok: false, detail: `探测失败: ${cuaInfo.error}` }));
+} else if (!cuaInfo.status.supported) {
+  check('屏幕操作助手（CUA）', () => ({ ok: true, detail: `非 macOS 平台（${cuaInfo.status.platform}），cua_* 工具族不可用` }));
+} else {
+  const st = cuaInfo.status;
+  check('屏幕操作助手编译（host/cua-helper）', () => st.helperCompiled
+    ? { ok: true, detail: `已编译（tier ${st.tier}：A=helper / B=osascript / C=无授权）` }
+    : { ok: true, detail: st.swiftcAvailable
+      ? '未编译（可选增强）。跑一次 npm run setup 自动编译；当前 B/C 层可用（osascript：元素读/点击/输入；无坐标点击）'
+      : '未编译且本机无 swiftc（装 Xcode 或 xcode-select --install）。当前 B/C 层可用（osascript）' });
+  check('CUA 系统授权（辅助功能/屏幕录制）', () => {
+    if (st.tier === 'C') return { ok: false, detail: `辅助功能未授权 → 系统设置 → 隐私与安全性 → 辅助功能，勾选运行服务的终端/应用后重跑 doctor（当前仅窗口清单${st.helperCompiled ? '（CGWindowList）' : ''}与截图可用）` };
+    const screen = st.screenGranted === true ? '已授权' : '未授权/未知（截图可能只剩桌面壁纸 → 屏幕录制里勾选同一项）';
+    return { ok: true, detail: `辅助功能 ✓（tier ${st.tier}）；屏幕录制：${screen}` };
+  });
 }
 
 console.log('chrome-agent-browser 体检报告');

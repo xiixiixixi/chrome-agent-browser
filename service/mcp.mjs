@@ -26,6 +26,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CDP_ALLOWLIST } from '../shared/protocol.mjs';
 import { Locator } from './locator.mjs';
 import { createLogin } from './login.mjs';
+import { createCua, registerCuaTools } from './cua.mjs';
 
 const EVAL_TIMEOUT_MS = 30_000;
 
@@ -70,15 +71,16 @@ function fmtValue(v) {
 }
 
 /**
- * 构建 MCP 服务器（21 个工具）。
- * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null, audit?: object|null, credentials?: object|null}} opts
+ * 构建 MCP 服务器（21 个浏览器工具 + 9 个 cua_* 屏幕操作工具）。
+ * @param {{api: object, policy?: object|null, connections?: Function|object|Array|null, audit?: object|null, credentials?: object|null, cua?: object|null}} opts
  *   api         —— createAgentApi 的返回值（必填）
  *   policy      —— service/policy.mjs 的 Policy 实例（缺省时跳过工具层策略，api 层仍可能拦）
  *   connections —— 取活连接的方式（ab_download_open / ab_viewport 需要直连 connection.cmd）
  *   audit       —— service/audit.mjs 的审计实例（ab_audit 查询用；缺省时该工具报未装配）
  *   credentials —— service/credentials.mjs 的凭据仓句柄（ab_login/ab_credentials 用；缺省时报不支持）
+ *   cua         —— service/cua.mjs 的 createCua() 返回值（缺省时在此构造；测试注入 fake）
  */
-export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null, audit = null, credentials = null } = {}) {
+export function buildMcpServer({ api, policy = null, connections = null, serviceInfo = null, audit = null, credentials = null, cua = null } = {}) {
   if (!api || typeof api.browsers?.getDefault !== 'function') {
     throw new TypeError('buildMcpServer requires { api } — createAgentApi() 的返回对象');
   }
@@ -86,10 +88,12 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
   //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
   const server = new McpServer(
-    { name: 'chrome-agent-browser', version: '0.4.0' },
+    { name: 'chrome-agent-browser', version: '0.5.0' },
     { capabilities: { logging: {} } },
   );
   const loginFlow = createLogin({ credentials, audit }); // ab_login 流程（credentials 为 null 时由工具层先拦）
+  // 屏幕操作（CUA）工具族：与浏览器链路同一进程；懒探测（构造零开销，首次调用才 spawn）
+  const cuaCtx = cua ?? createCua({ audit, policy });
 
   // tabId → { browser, tab }：new/claim 时登记；未知 tabId 跨浏览器探测后缓存
   const tabRegistry = new Map();
@@ -549,6 +553,9 @@ export function buildMcpServer({ api, policy = null, connections = null, service
     }
     return textResult({ origins: await credentials.list() });
   }));
+
+  // ---- 11g. cua_* 屏幕操作工具族（三层能力：helper / osascript / 仅截图，详见 service/cua.mjs）----
+  registerCuaTools(server, { cua: cuaCtx });
 
   // ---- 12. browser_eval（REPL，本项目核心特色） ----
   server.registerTool('browser_eval', {
