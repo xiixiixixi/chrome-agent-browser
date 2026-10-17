@@ -202,11 +202,12 @@ npm run credential -- remove https://github.com
 ## 测试
 
 ```bash
-npm test          # 128 个单元测试
+npm test          # 135+ 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
 npm run cua-selftest  # 屏幕操作自检（只读探测 + 试拍，不做任何点击）
 npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听/CUA 助手与授权，逐项给修复建议
 npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome；登录用例会短暂写入并清理本机钥匙串测试条目）
+npm run verify    # 一键真机验收：起服务等真实浏览器扩展连入（40s），11 项检查（标签/导航/截图/批量阅读/WebMCP/审计/CUA/幽魂试闪）输出记分卡；只动自建标签页
 npm run check     # 全部语法检查
 ```
 
